@@ -109,9 +109,11 @@ class Failures:
     ) -> Failure:
         async with self._lock:
             item = self._failures.setdefault(key, Failure(account_id=account_id))
-            if item.blocked:
-                return item.model_copy()
             maximum = retry_limit() if limit is None else limit
+            if item.blocked:
+                # blocked 只表示告警已发；巡检入口仍会冷却重试，这里续上冷却时间
+                item.retry_after = time.time() + self.delay(maximum)
+                return item.model_copy()
             item.attempts += 1
             item.blocked = item.attempts >= maximum
             item.retry_after = time.time() + (self.delay(item.attempts) if delay is None else delay)

@@ -339,8 +339,14 @@ class Service:
         except ApiError as error:
             if not error.is_auth:
                 raise
-            await self.expire_account(account)
-            raise AuthenticationError(TOKEN_EXPIRED_MESSAGE) from None
+            # 网关/WAF 也会回 401/403，再用一次绕缓存的请求确认 token 是否真的失效
+            try:
+                info = await self.api.me(account.token, fresh=True)
+            except ApiError as confirmation:
+                if not confirmation.is_auth:
+                    raise
+                await self.expire_account(account)
+                raise AuthenticationError(TOKEN_EXPIRED_MESSAGE) from None
         if str(info.cuid) != account.cuid:
             raise DataError("服务端返回的 CUID 与绑定账号不一致，已停止本次操作。")
         if info.is_domestic is not None and info.is_domestic != account.domestic:
@@ -1663,7 +1669,8 @@ class Service:
         """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
         if self.closing or not self.database_ready:
             return
-        if not self.failures.allows("maintain"):
+        # blocked 只代表告警已发，冷却后仍要重试，否则巡检会永久停摆
+        if self.failures.blocked("maintain") and self.failures.retry_after("maintain") > time.time():
             return
         try:
             await self._maintain()
@@ -1805,7 +1812,8 @@ class Service:
     async def flush_notices(self) -> None:
         if self.closing or not self.database_ready:
             return
-        if not self.failures.allows("notice_loop"):
+        # blocked 只代表告警已发，冷却后仍要重试，否则巡检会永久停摆
+        if self.failures.blocked("notice_loop") and self.failures.retry_after("notice_loop") > time.time():
             return
         try:
             await self._flush_notices()
