@@ -33,6 +33,16 @@ RESULT_PAGE_SIZE = 40
 AVATAR_CACHE_BYTES = 16 * 1024 * 1024
 AVATAR_CACHE_ITEMS = 256
 CATALOG_PATH = Path(__file__).parent.parent / "assets" / "tappo" / "catalog.json"
+ROLE_ASSET = re.compile(r"(?:role|emote)_(\d+)_[a-z0-9]+(?:\.png)?", re.I)
+
+
+def asset_role(role_id: str | int, asset_name: str | None) -> str:
+    """物品所属角色 ID；线上图鉴目录的 role_id 全为 0，角色只写在素材名里。"""
+    role = str(role_id).strip()
+    if role and role != "0":
+        return role
+    match = ROLE_ASSET.fullmatch(asset_name or "")
+    return match[1] if match else "0"
 
 
 class CatalogEntry(BaseModel):
@@ -147,7 +157,7 @@ class Cards:
                     name=self.resources.name(item.asset_name, item.asset_id),
                     type="character" if item.asset_type == "character_skin" else item.asset_type,
                     rarity=str(item.rarity).lower(),
-                    role=item.role_id,
+                    role=asset_role(item.role_id, item.asset_name),
                 )
                 for item in live.items
             }
@@ -251,14 +261,21 @@ class Cards:
         uid = str(info.player_id) if info and info.player_id else ""
         return Header(nickname=nickname, uid=uid if uid != "0" else "", available=available, avatar=face)
 
-    def progress(self, items: list[Item]) -> list[Progress]:
+    def catalog_count(self, kind: str, rarity: str | None = None, roles: set[str] | None = None) -> int:
+        entries = self.catalog_group(kind, rarity)
+        return len(entries) if roles is None else sum(str(entry.role) in roles for entry in entries)
+
+    def progress(self, items: list[Item], rarity: str | None = None, roles: set[str] | None = None) -> list[Progress]:
+        """三类收集进度；给出稀有度或角色时，已有和总数都只统计该范围。"""
         owned: dict[str, set[str]] = {kind: set() for kind in KINDS}
         for item in items:
-            if item.quantity > 0:
+            if item.quantity > 0 and self.in_scope(item, rarity, roles):
                 kind = self.kind(item.asset_id, item.asset_type)
                 if kind in owned:
                     owned[kind].add(str(item.asset_id))
-        return [Progress(label, len(owned[kind]), len(self.catalog_group(kind))) for kind, label in KINDS.items()]
+        return [
+            Progress(label, len(owned[kind]), self.catalog_count(kind, rarity, roles)) for kind, label in KINDS.items()
+        ]
 
     async def draw(
         self, header: Header, title: str, cards: list[Card], note: str, progress: list[Progress] | None = None
@@ -370,55 +387,57 @@ class Cards:
         return await self.draw(header, "开箱结果", cards, note, context.progress)
 
     def item_role(self, item: Item) -> str:
-        role = str(item.role_id).strip()
-        if role and role != "0":
+        role = asset_role(item.role_id, item.asset_name)
+        if role != "0":
             return role
-        match = re.fullmatch(r"(?:role|emote)_(\d+)_[a-z0-9]+(?:\.png)?", item.asset_name or "", re.I)
-        if match:
-            return match[1]
         entry = self.catalog.get(str(item.asset_id))
         return str(entry.role) if entry is not None else "0"
 
-    def filter_bag(self, items: list[Item], filters: BagFilter) -> list[Item]:
-        role_ids: set[str] | None = None
-        if filters.role:
-            roles = dict(self._bundled_roles)
-            if self.resources.dictionary is not None:
-                roles.update(self.resources.dictionary.character)
-            role_ids = {key for key, name in roles.items() if name == filters.role}
-            if not role_ids:
-                raise WuwaError(f"未找到角色“{filters.role}”，请使用完整角色名，例如 角色=今汐。")
-        catalog = self.catalog
+    def role_ids(self, name: str) -> set[str] | None:
+        if not name:
+            return None
+        roles = dict(self._bundled_roles)
+        if self.resources.dictionary is not None:
+            roles.update(self.resources.dictionary.character)
+        found = {key for key, value in roles.items() if value == name}
+        if not found:
+            raise WuwaError(f"未找到角色“{name}”，请使用完整角色名，例如 角色=今汐。")
+        return found
+
+    def in_scope(self, item: Item, rarity: str | None, roles: set[str] | None) -> bool:
+        if rarity:
+            entry = self.catalog.get(str(item.asset_id))
+            if str(item.rarity or (entry.rarity if entry is not None else "")).strip().lower() != rarity:
+                return False
+        return roles is None or self.item_role(item) in roles
+
+    def filter_bag(self, items: list[Item], filters: BagFilter, roles: set[str] | None) -> list[Item]:
         selected = []
         for item in items:
-            if item.quantity <= 0:
+            if item.quantity <= (1 if filters.duplicates else 0):
                 continue
             if filters.kind and self.kind(item.asset_id, item.asset_type) != filters.kind:
                 continue
-            if filters.rarity:
-                entry = catalog.get(str(item.asset_id))
-                rarity = str(item.rarity or (entry.rarity if entry is not None else "")).strip().lower()
-                if rarity != filters.rarity:
-                    continue
-            if filters.duplicates and item.quantity <= 1:
-                continue
-            if role_ids is not None and self.item_role(item) not in role_ids:
-                continue
-            selected.append(item)
+            if self.in_scope(item, filters.rarity, roles):
+                selected.append(item)
         return selected
 
     async def backpack(
         self, account: Account, items: list[Item], event: Event, filters: BagFilter | None = None
     ) -> list[bytes]:
         filters = filters or BagFilter()
-        selected = self.filter_bag(items, filters)
+        roles = self.role_ids(filters.role)
+        selected = self.filter_bag(items, filters, roles)
         if filters.description and not selected:
             raise WuwaError(f"没有符合条件的背包物品：{filters.description}。")
         info = UserInfo.model_validate_json(account.info)
         header = await self.header(account, info.remaining, event)
-        progress = self.progress(items)
+        # 数量跟随筛选范围：稀有度、角色限定三类进度和各稀有度的总数，分类再限定右上角的已收集；
+        # “重复”只决定显示哪些格子，不改变收集口径。
+        progress = self.progress(items, filters.rarity, roles)
+        counted = [row for kind, row in zip(KINDS, progress, strict=True) if filters.kind in (None, kind)]
         header.available = None
-        header.collected = (sum(row.owned for row in progress), sum(row.total for row in progress))
+        header.collected = (sum(row.owned for row in counted), sum(row.total for row in counted))
         groups: dict[str, list[Item]] = {name: [] for name in KINDS} if filters.kind is None else {filters.kind: []}
         for item in selected:
             groups.setdefault(self.kind(item.asset_id, item.asset_type), []).append(item)
@@ -442,7 +461,7 @@ class Cards:
                         rarity,
                         selection,
                         len(selection),
-                        len(self.catalog_group(kind, rarity)),
+                        self.catalog_count(kind, rarity, roles),
                     )
                     for rarity in ATLAS_RARITIES
                     if (selection := [card for card in cards if card.rarity == rarity])

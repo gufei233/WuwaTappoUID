@@ -1,6 +1,6 @@
 [project]
 name = "WuwaTappoUID"
-version = "0.1.54"
+version = "0.1.55"
 description = "WuwaTappo 账号、背包、点击与定时宝箱插件"
 requires-python = ">=3.11,<4.0"
 dependencies = ["aiohttp>=3.10,<4", "qrcode>=7.4,<9"]
