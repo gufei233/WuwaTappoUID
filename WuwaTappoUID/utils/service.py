@@ -1663,7 +1663,8 @@ class Service:
         """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
         if self.closing or not self.database_ready:
             return
-        if not self.failures.allows("maintain"):
+        # 冷却期内不重试；达到告警阈值后冷却结束仍继续尝试，成功即恢复，不必等重启。
+        if self.failures.retry_after("maintain") > time.time():
             return
         try:
             await self._maintain()
@@ -1805,7 +1806,8 @@ class Service:
     async def flush_notices(self) -> None:
         if self.closing or not self.database_ready:
             return
-        if not self.failures.allows("notice_loop"):
+        # 冷却期内不重试；达到告警阈值后冷却结束仍继续尝试，成功即恢复，不必等重启。
+        if self.failures.retry_after("notice_loop") > time.time():
             return
         try:
             await self._flush_notices()
