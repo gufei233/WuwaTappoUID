@@ -597,6 +597,9 @@ class LoginManager:
             return
         try:
             row = await self.get_key(snapshot.id)
+            if row.external_synced:
+                self._remote_retries.pop(row.id, None)
+                return
             if row.id in self._checkpoints:
                 return
             if row.expires_at <= time.time():
@@ -604,11 +607,8 @@ class LoginManager:
                     row = await self.finish_due(await self.get_key(row.id))
                     if row.id in self._checkpoints:
                         return
-                # 链接过期停止通信；已经成功的绑定和保存的 token 保留。
-                row.external_synced = True
-                row.external_poll_token = ""
-                row.external_result_pending = False
-                await Store.save(row)
+                    # 链接过期停止通信；已经成功的绑定和保存的 token 保留。
+                    await LoginStore.expire_external(row.id, time.time())
                 self._remote_retries.pop(row.id, None)
                 return
             if row.status == "processing":
@@ -626,27 +626,26 @@ class LoginManager:
             else:
                 result = self.response(row)
             await login_remote.confirm(self.service.api, row, result)
-            row.external_result_pending = False
-            # verifying 会话等待用户在页面点击继续，只验证已保存的 token。
-            if row.status not in ("pending", "verifying"):
-                row.external_synced = True
-                row.external_poll_token = ""
-            await Store.save(row)
+            async with self.service.user_lock(row.owner_id):
+                if row.id not in self._checkpoints:
+                    await LoginStore.confirm_external(row)
             self._remote_retries.pop(row.id, None)
         except SQLAlchemyError:
             raise
         except Exception as error:
-            row = await Store.login_session(snapshot.id)
-            if row is None or row.id in self._checkpoints:
-                return
-            if row.expires_at <= time.time():
-                # 正常到期不触发后台故障告警，也不撤销已完成的账号绑定。
-                row.external_synced = True
-                row.external_poll_token = ""
-                row.external_result_pending = False
-                await Store.save(row)
-                self._remote_retries.pop(row.id, None)
-                return
+            async with self.service.user_lock(snapshot.owner_id):
+                row = await Store.login_session(snapshot.id)
+                if row is None or row.id in self._checkpoints:
+                    return
+                if row.external_synced:
+                    self._remote_retries.pop(row.id, None)
+                    return
+                if row.expires_at <= time.time():
+                    # 正常到期不触发后台故障告警，也不撤销已完成的账号绑定。
+                    await self.finish_due(row)
+                    await LoginStore.expire_external(row.id, time.time())
+                    self._remote_retries.pop(row.id, None)
+                    return
             detail = self.service.error_detail(error)
             if attempts == 0:
                 if isinstance(error, WuwaError):

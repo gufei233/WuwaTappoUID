@@ -17,6 +17,43 @@ def digest(value: str) -> str:
 class LoginStore:
     @classmethod
     @with_session
+    async def confirm_external(cls, session: AsyncSession, expected: LoginSession) -> bool:
+        row = await session.get(LoginSession, expected.id)
+        if row is None or row.external_synced or row.expires_at <= time.time():
+            return False
+        # 确认期间可产生新提交或新结果，旧响应只能确认自己发送的那份结果。
+        if (
+            row.status != expected.status
+            or row.account_id != expected.account_id
+            or row.token_digest != expected.token_digest
+            or row.message != expected.message
+            or row.result != expected.result
+            or row.submission != expected.submission
+            or row.external_result_pending != expected.external_result_pending
+            or row.external_poll_token != expected.external_poll_token
+        ):
+            return False
+        row.external_result_pending = False
+        if row.status not in ("pending", "verifying"):
+            row.external_synced = True
+            row.external_poll_token = ""
+        session.add(row)
+        return True
+
+    @classmethod
+    @with_session
+    async def expire_external(cls, session: AsyncSession, key: str, now: float) -> bool:
+        row = await session.get(LoginSession, key)
+        if row is None or row.expires_at > now:
+            return False
+        row.external_synced = True
+        row.external_poll_token = ""
+        row.external_result_pending = False
+        session.add(row)
+        return True
+
+    @classmethod
+    @with_session
     async def token(
         cls,
         session: AsyncSession,

@@ -547,7 +547,9 @@ class Service:
                     await self.finish(task, "stopped", "已删除绑定，自动开箱已停止")
                 remaining = [a for a in accounts if a.id != target.id]
                 replacement = remaining[0].id if remaining else None
-                await Store.delete_link(owner, target.id, replacement)
+                finalized_notices = await Store.delete_link(owner, target.id, replacement)
+                for notice_id in finalized_notices:
+                    self.release_notice_image(notice_id)
                 updated = await Store.account(target.id)
                 if target.token and (updated is None or not updated.token):
                     self.api.retire_token(target.token)
@@ -561,6 +563,7 @@ class Service:
         return (
             f"已删除 CUID {mask_cuid(target.cuid)}（{'国服' if target.domestic else '海外'}）的绑定。"
             + ("本人开启的任务已停止并汇总。" if stopped else "")
+            + ("剩余开箱结果将补发；未判定的新物品不标 NEW。" if finalized_notices else "")
             + current
         )
 
@@ -1912,7 +1915,10 @@ class Service:
                         if task is not None and task.subscription_id == subscription_id:
                             await self.pause_invalid_route(task)
                 continue
-            if sub.WS_BOT_ID not in gss.active_bot:
+            # 重连后的旧标识交给 Subscribe.send 按平台回退并修正路由。
+            if sub.WS_BOT_ID not in gss.active_bot and not any(
+                bot.bot_id == sub.bot_id for bot in gss.active_bot.values()
+            ):
                 continue
             event = Event(
                 bot_id=sub.bot_id,

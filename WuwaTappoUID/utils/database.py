@@ -471,7 +471,9 @@ class Store:
 
     @classmethod
     @with_session
-    async def delete_link(cls, session: AsyncSession, owner_id: str, account_id: str, replacement: str | None) -> None:
+    async def delete_link(
+        cls, session: AsyncSession, owner_id: str, account_id: str, replacement: str | None
+    ) -> list[str]:
         account = await session.get(Account, account_id)
         if account is not None and account.sdk_owner_id == owner_id:
             account.clear_sdk()
@@ -498,6 +500,46 @@ class Store:
                 account.clear_sdk()
                 account.token_state = "expired"
                 account.token_expires_at = account.token_renew_after = 0
+            result = await session.execute(
+                select(ChestRecord)
+                .where(
+                    col(ChestRecord.account_id) == account_id,
+                    col(ChestRecord.state) == "success",
+                    col(ChestRecord.notice_id) == "",
+                )
+                .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
+            )
+            grouped: dict[tuple[str, int], list[ChestRecord]] = {}
+            for record in result.scalars().all():
+                grouped.setdefault((record.run_id, record.subscription_id), []).append(record)
+            changed: list[str] = []
+            for (_, subscription_id), records in grouped.items():
+                notice = Notice(
+                    account_id=account_id,
+                    subscription_id=subscription_id,
+                    text=f"本次 {len(records)} 个 · 账号已解绑，未判定物品不标 NEW",
+                    record_ids=json.dumps([record.id for record in records]),
+                    new_checked=True,
+                )
+                session.add(notice)
+                for record in records:
+                    record.notice_id = notice.id
+                changed.append(notice.id)
+            result = await session.execute(
+                select(Notice).where(
+                    col(Notice.account_id) == account_id,
+                    col(Notice.delivery_state) == "pending",
+                    col(Notice.new_checked).is_(False),
+                    col(Notice.record_ids) != "",
+                )
+            )
+            # 主动解除最后绑定后无法再读取背包；保留已判定的 fresh，不猜测剩余物品的 NEW。
+            for notice in result.scalars().all():
+                notice.new_checked = True
+                notice.text = f"本次 {len(json.loads(notice.record_ids))} 个 · 账号已解绑，未判定物品不标 NEW"
+                changed.append(notice.id)
+            return changed
+        return []
 
     @classmethod
     @with_read_session
