@@ -22,6 +22,7 @@ from ..utils.lifecycle import tracked
 from ..utils.render_cache import HelpImageCache
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
 from ..utils.statistics import StatisticsPeriod
+from ..utils.synthesis import SynthesisOptions
 
 
 async def help_image() -> bytes:
@@ -129,12 +130,12 @@ async def execute_command(bot: Bot, event: Event) -> None:
                 raise WuwaError("请输入正整数，例如 wt增加次数1000 或 wt增加次数 1000。")
             replies = await service.increase(event, int(argument))
         elif command == "合成":
-            if argument not in ("", "同阶", "升阶"):
-                raise WuwaError("用法：wt合成（默认升阶）、wt合成 升阶，或 wt合成 同阶。")
-            mode = argument or "升阶"
+            options = SynthesisOptions.parse(argument)
             await service.bound(event)
-            await bot.send(f"开始{mode}合成多余物品：跳过收藏，每种保留 1 件，本轮只进行{mode}合成。")
-            replies = await service.synthesize(event, same_level=mode == "同阶")
+            await bot.send(
+                f"开始{options.mode_name}合成多余物品：本轮{options.scope}，跳过收藏，每种保留 1 件。"
+            )
+            replies = await service.synthesize(event, options)
         elif command == "兑换":
             if not argument or len(argument.split()) != 1:
                 raise WuwaError("用法：wt兑换 CODE，为当前账号使用一个兑换码。")

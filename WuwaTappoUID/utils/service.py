@@ -62,7 +62,7 @@ from .schema import (
 )
 from .settings import bot_name, chest_task_hours, max_click_increment, record_retention_days, retry_limit, settings
 from .statistics import CHINA, ChestStatistics, StatisticsPeriod
-from .synthesis import highest_tiers, next_recipe
+from .synthesis import SynthesisOptions, highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
 
@@ -753,10 +753,9 @@ class Service:
         stats = await asyncio.to_thread(ChestStatistics.aggregate, groups)
         return [await self.cards.chest_statistics(account, event, period, stats, first_at)]
 
-    async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:
+    async def synthesize(self, event: Event, options: SynthesisOptions) -> list[str | bytes]:
         results: list[SynthesisResult] = []
         upgrades = same_count = spent = 0
-        mode_name = "同阶" if same_level else "升阶"
         problem = ""
         bag_current = True
         run_id = new_id()
@@ -766,10 +765,10 @@ class Service:
                 await self.refresh(account)
                 items = await self.read_bag(account)
                 owned_before = {str(item.asset_id) for item in items if item.quantity > 0}
-                highest = {} if same_level else highest_tiers(await self.api.atlas())
+                highest = {} if options.same_level else highest_tiers(await self.api.atlas())
                 while not self.closing:
                     try:
-                        recipe = next_recipe(items, highest, same_level=same_level)
+                        recipe = next_recipe(items, highest, same_level=options.same_level, kind=options.kind)
                     except WuwaError as error:
                         problem = str(error)
                         break
@@ -841,11 +840,14 @@ class Service:
                         problem = "服务端背包数量尚未与合成消耗一致，本轮已停止；请用 wt背包 核对。"
                         break
         self.wake_notices()
-        summary = f"本轮已确认：升阶 {upgrades} 次，同阶 {same_count} 次。"
+        summary = f"本轮范围：{options.scope}。已确认：升阶 {upgrades} 次，同阶 {same_count} 次。"
         summary += f"消耗多余物品 {spent} 件，获得 {len(results)} 件。"
         if not results and not problem:
-            cost = 5 if same_level else 10
-            return [f"没有足够的多余物品可{mode_name}合成：已跳过收藏，每种保留 1 件，需同品类同稀有度 {cost} 件。"]
+            cost = 5 if options.same_level else 10
+            return [
+                f"{options.scope}没有足够的多余物品可{options.mode_name}合成："
+                f"已跳过收藏，每种保留 1 件，需同品类同稀有度 {cost} 件。"
+            ]
         if problem:
             summary += "\n" + problem
         if not results:
@@ -856,7 +858,7 @@ class Service:
                 results,
                 items if bag_current else None,
                 event,
-                f"升阶 {upgrades} 次 · 同阶 {same_count} 次",
+                f"{options.scope} · 升阶 {upgrades} 次 · 同阶 {same_count} 次",
                 owned_before,
             )
         except Exception:
