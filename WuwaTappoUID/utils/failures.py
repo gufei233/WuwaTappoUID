@@ -144,6 +144,10 @@ class Failures:
             del self._failures[key]
             logger.info(f"[WuwaTappoUID] 后台阶段 {key.split(':', 1)[0]} 已恢复。")
 
+    async def reset(self, key: str) -> None:
+        """清除某阶段的失败计数，让下一轮重新尝试；不代表该阶段已恢复，所以不记恢复日志。"""
+        self._failures.pop(key, None)
+
     async def reset_account(self, account_id: str) -> None:
         for key in [key for key, value in self._failures.items() if value.account_id == account_id]:
             del self._failures[key]

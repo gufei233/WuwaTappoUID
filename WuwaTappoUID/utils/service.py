@@ -265,11 +265,12 @@ class Service:
                 return self.expired_message(account, binding.id)
         return str(error)
 
-    async def expire_account(self, account: Account) -> None:
-        """已确认 token 失效；只通知一次，更新有效 token 后恢复鉴权暂停的任务。"""
+    async def expire_account(self, account: Account) -> bool:
+        """已确认 token 失效；只通知一次，更新有效 token 后恢复鉴权暂停的任务。返回本次是否生成了失效通知。"""
         was_expired = account.token_state == "expired"
         account.token_state = "expired"
         task = await Store.task(account.id)
+        announced = False
         if task is not None and task.status in ("active", "paused"):
             if task.status == "active":
                 task.status = "paused"
@@ -288,12 +289,32 @@ class Service:
                         ),
                     )
                 )
+                announced = True
             await Store.save(*rows)
             self.schedule(task)
         elif not was_expired:
-            await Store.save(account)
+            # 没有运行中的任务时，只在有待判 NEW 的结果要留到登录恢复后才说明一次。
+            waiting = sorted(
+                {
+                    notice.subscription_id
+                    for notice in await Store.notices(account.id)
+                    if notice.record_ids and not notice.new_checked
+                }
+            )
+            message = self.expired_message(account, task.owner_id if task is not None else "")
+            notices = [
+                Notice(
+                    subscription_id=subscription_id,
+                    account_id=account.id,
+                    text=f"{date_text(time.time())}：{message}\n未发送的开箱结果将在登录恢复后补发。",
+                )
+                for subscription_id in waiting
+            ]
+            await Store.save(account, *notices)
+            announced = bool(notices)
 
         self.api.retire_token(account.token)
+        return announced
 
     async def account_notice(self, account: Account, text: str) -> None:
         task = await Store.task(account.id)
@@ -1023,9 +1044,10 @@ class Service:
                     pass
                 except WuwaError as error:
                     if isinstance(error, ApiError) and error.is_auth:
-                        await self.expire_account(account)
+                        announced = await self.expire_account(account)
                         await self.failures.success("reconcile:" + account.id)
-                        expired_note = "\n" + self.expired_message(account, task.owner_id)
+                        if not announced:
+                            expired_note = "\n" + self.expired_message(account, task.owner_id)
                     elif isinstance(error, ApiError) and error.code == 10014:
                         pass
                     else:
@@ -1263,6 +1285,8 @@ class Service:
         unresolved = await Store.unresolved(task.account_id)
         clear = True
         now = time.time()
+        # 结果未确认、确认未生效后继续重试都是中间状态，只记日志；开成功发结果，重试耗尽才通知用户。
+        label = f"CUID {mask_cuid(task.account_id.split(':', 1)[-1])}"
         for record in unresolved:
             before = UserInfo.model_validate_json(record.before_info)
             side: Side = "left" if record.side == "left" else "right"
@@ -1271,27 +1295,31 @@ class Service:
             elif now - record.created_at >= SETTLE_SECONDS:
                 # 成功开箱一定会推进该侧冷却；早已超时仍未推进，说明请求没有生效（包括没发出去）。
                 record.state = "not_applied"
-                await Store.save(
-                    record,
-                    Notice(
-                        subscription_id=record.subscription_id,
-                        account_id=record.account_id,
-                        text=f"{SIDE_NAMES[side]}宝箱上次请求没有生效（该侧冷却未变化）。"
-                        + ("将按重试次数限制继续处理。" if task.status == "active" else "本次仅核对结果，不重新开箱。"),
-                    ),
-                )
-            else:
-                clear = False
-                if record.state != "uncertain":
-                    record.state = "uncertain"
+                if task.status == "active":
+                    logger.warning(
+                        f"[WuwaTappoUID] {label}：{SIDE_NAMES[side]}宝箱上次请求没有生效（该侧冷却未变化），"
+                        "将按重试次数限制继续处理。"
+                    )
+                    await Store.save(record)
+                else:
+                    # 任务已不再运行，这次核对就是最终结论，告知用户。
                     await Store.save(
                         record,
                         Notice(
                             subscription_id=record.subscription_id,
                             account_id=record.account_id,
-                            text=f"{SIDE_NAMES[side]}宝箱结果尚未确认，暂缓开箱并继续查询，避免重复请求。",
+                            text=f"{SIDE_NAMES[side]}宝箱上次请求没有生效（该侧冷却未变化）。本次仅核对结果，不重新开箱。",
                         ),
                     )
+            else:
+                clear = False
+                if record.state != "uncertain":
+                    record.state = "uncertain"
+                    logger.warning(
+                        f"[WuwaTappoUID] {label}：{SIDE_NAMES[side]}宝箱结果尚未确认，"
+                        "暂缓开箱并继续查询，避免重复请求。"
+                    )
+                    await Store.save(record)
         if unresolved:
             # 中断后迟到的成功结果也立刻补发，不等下一次十件或到期。
             await self.queue_results(task.account_id, force=True, reason="开箱请求核对结果")
@@ -1354,7 +1382,8 @@ class Service:
                 record.state = "rejected"
                 record.result = str(error)
                 await Store.save(record)
-                if error.code not in (70005, 70006):
+                # 无可用宝箱、仍在冷却、服务端忙只是稍后再查，点击不足另行处理，都不在这里汇总结果。
+                if error.code not in (70004, 70005, 70006, 10014):
                     await self.queue_results(account.id, force=True, reason="开箱失败，汇总已开结果")
                 if error.code == 70005 and attempt == 0:
                     info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task)
@@ -1934,6 +1963,8 @@ class Service:
                     return
                 except AuthenticationError:
                     await self.failures.success("notice-bag:" + key)
+                    # 失效通知在本轮取出通知之后才生成，稍后再巡检一次把它发出去。
+                    self._notice_again = True
                 except (WuwaError, TimeoutError) as error:
                     if isinstance(error, ApiError) and error.code == 10014:
                         return
@@ -1945,18 +1976,29 @@ class Service:
                     )
                     if unchecked and not failure.blocked:
                         return
+        # 登录态失效时拿不到背包快照：待判 NEW 的结果留到登录恢复后再出图，其余通知照常发送。
+        waiting = account is not None and account.token_state in ("expired", "recovering")
+        fallback_sent = False
         for subscription_id, (event, notices) in available.items():
+            if waiting:
+                notices = [notice for notice in notices if not notice.record_ids or notice.new_checked]
+                if not notices:
+                    continue
             gate = self._notice_sends.setdefault(subscription_id, NoticeSendGate(asyncio.Lock()))
             gate.users += 1
             try:
                 async with gate.lock:
-                    await self._send_notice_group(
-                        key, subscription_id, event, notices, account, progress, bool(unchecked)
-                    )
+                    if await self._send_notice_group(
+                        key, subscription_id, event, notices, account, progress, bool(unchecked) and not waiting
+                    ):
+                        fallback_sent = True
             finally:
                 gate.users -= 1
                 if not gate.users:
                     del self._notice_sends[subscription_id]
+        if fallback_sent:
+            # 文字兜底已送达：清掉背包快照的失败计数，下一组结果重新尝试出图。
+            await self.failures.reset("notice-bag:" + key)
         await self.failures.success("notice-account:" + key)
 
     async def _send_notice_group(
@@ -1968,23 +2010,19 @@ class Service:
         account: Account | None,
         progress: list[Progress] | None,
         unchecked: bool,
-    ) -> None:
+    ) -> bool:
+        """发送一组通知；返回本组是否以文字兜底送达。"""
         if self.closing:
-            return
+            return False
         send_key = f"notice:{key}:{subscription_id}"
         render_key = f"render:{key}:{subscription_id}"
         if not self.failures.allows(send_key):
-            return
+            return False
         if not self.failures.blocked(render_key) and not self.failures.allows(render_key):
-            return
+            return False
         contexts = {}
         contents: list[Message] = []
-        skip_image = unchecked and (
-            self.failures.blocked("notice-bag:" + key)
-            or account is not None
-            and account.token_state in ("expired", "recovering")
-        )
-        if not self.failures.blocked(render_key) and not skip_image:
+        if not self.failures.blocked(render_key) and not (unchecked and self.failures.blocked("notice-bag:" + key)):
             try:
                 if any(notice.record_ids for notice in notices) and account is not None:
                     contexts[key] = ResultContext(await self.cards.header(account, None, event), progress)
@@ -1994,18 +2032,16 @@ class Service:
             except SQLAlchemyError:
                 raise
             except MaintenanceError:
-                return
+                return False
             except Exception as error:
                 if self.failures.attempts(render_key) == 0:
                     logger.exception("[WuwaTappoUID] 通知图片绘制失败")
                 failure = await self.failures.fail(render_key, "通知图片绘制", self.error_detail(error), key)
                 if not failure.blocked:
-                    return
-        if not contents or self.failures.blocked(render_key):
-            fallback = "结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n"
-            if account is not None and account.token_state == "expired":
-                fallback += self.expired_message(account, identity(event.bot_id, event.user_id)) + "\n"
-            contents = [MessageSegment.text(fallback)]
+                    return False
+        fallback = not contents or self.failures.blocked(render_key)
+        if fallback:
+            contents = [MessageSegment.text("结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n")]
             for notice in notices:
                 text = notice.text.replace(account.cuid, mask_cuid(account.cuid)) if account else notice.text
                 contents.append(MessageSegment.text(text + "\n"))
@@ -2018,7 +2054,7 @@ class Service:
             sub = await Store.subscription(subscription_id)
             if sub is None or not sub.WS_BOT_ID:
                 self._notice_again = True
-                return
+                return False
             async with asyncio.timeout(15):
                 submitted = await sub.send(messages)
             if submitted != 0:
@@ -2028,8 +2064,12 @@ class Service:
         except Exception as error:
             await Store.notice_error(ids, f"推送异常：{type(error).__name__}")
             await self.failures.fail(send_key, "结果通知发送", self.error_detail(error), key)
-            return
+            return False
         await Store.mark_submitted(ids)
         await self.failures.success(send_key)
         for notice in notices:
             self.release_notice_image(notice.id)
+        if fallback:
+            # 文字兜底已送达：清掉绘图的失败计数，下一组重新尝试出图。
+            await self.failures.reset(render_key)
+        return fallback
