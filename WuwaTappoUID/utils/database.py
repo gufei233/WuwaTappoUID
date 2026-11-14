@@ -31,6 +31,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, col, select
 
+from .command_text import command_hint
+from .diagnostics import timed
 from .schema import DatabaseSchemaError, DataError, OpenResult
 
 
@@ -396,7 +398,11 @@ class Store:
             return False
         interrupted = row.status == "processing"
         status = "failed" if interrupted else "expired"
-        message = "登录处理已中断，请重新发送 wt登录。" if interrupted else "登录链接已过期，请重新发送 wt登录。"
+        message = (
+            command_hint("登录处理已中断，请重新发送 wt登录。")
+            if interrupted
+            else command_hint("登录链接已过期，请重新发送 wt登录。")
+        )
         deadline = LoginSession.expires_at <= now
         if startup:
             deadline = or_(deadline, LoginSession.status == "processing")
@@ -468,6 +474,35 @@ class Store:
         archived = select(func.coalesce(func.sum(col(ChestSummary.quantity)), 0)).where(col(ChestSummary.day) == 0)
         total_chests = await session.scalar(select(recent.scalar_subquery() + archived.scalar_subquery()))
         return bound_people, task_people, total_chests
+
+    @classmethod
+    @with_read_session
+    async def operational_statistics(cls, session: AsyncSession) -> dict[str, int | float | None]:
+        result: dict[str, int | float | None] = dict.fromkeys(
+            ("active", "manual", "auth", "failure", "route", "pending", "unroutable"), 0
+        )
+        result["oldest"] = None
+        tasks = await session.execute(
+            select(ChestTask.status, ChestTask.pause_reason, func.count())
+            .where(
+                col(ChestTask.status).in_(["active", "paused"]),
+                ChestTask.expires_at > func.coalesce(ChestTask.paused_at, time.time()),
+            )
+            .group_by(ChestTask.status, ChestTask.pause_reason)
+        )
+        for status, reason, count in tasks.all():
+            name = "active" if status == "active" else reason
+            result[name] = int(result.get(name) or 0) + count
+        notices = await session.execute(
+            select(Notice.delivery_state, func.count(), func.min(Notice.created_at))
+            .where(col(Notice.delivery_state).in_(["pending", "unroutable"]))
+            .group_by(Notice.delivery_state)
+        )
+        for state, count, oldest in notices.all():
+            result[state] = count
+            if state == "pending":
+                result["oldest"] = oldest
+        return result
 
     @classmethod
     @with_session
@@ -779,6 +814,7 @@ class Store:
         return rows
 
     @classmethod
+    @timed("database-write", slow=2)
     @with_session
     async def notice_attempts(cls, session: AsyncSession, ids: list[str]) -> None:
         await session.execute(
@@ -789,6 +825,7 @@ class Store:
         )
 
     @classmethod
+    @timed("database-write", slow=2)
     @with_session
     async def mark_submitted(cls, session: AsyncSession, ids: list[str]) -> None:
         now = time.time()
@@ -800,6 +837,7 @@ class Store:
         )
 
     @classmethod
+    @timed("database-write", slow=2)
     @with_session
     async def notice_error(cls, session: AsyncSession, ids: list[str], message: str) -> None:
         await session.execute(
@@ -839,6 +877,7 @@ class Store:
         return await session.get(Subscribe, subscription_id)
 
     @classmethod
+    @timed("database-write", slow=2)
     @with_session
     async def save(cls, session: AsyncSession, *rows: SQLModel) -> None:
         # 一次调用内保存任务、开箱结果和待发通知，同一事务提交。

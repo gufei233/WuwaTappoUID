@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, JsonValue
 
+from .command_text import command_hint
+
 BASE = "https://api-mc-wuwatappo.kurogames-global.com"
 ORIGIN = "http://tauri.localhost"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 WuwaTappo/1.0"
@@ -43,7 +45,7 @@ class ApiError(WuwaError):
             10002: "登录鉴权被拒绝（10002）",
             10003: "登录鉴权被拒绝（10003）",
             90002: "账号已在其他设备登录（90002）",
-            10024: "库洛登录凭据校验失败，请重新发送 wt登录（10024）",
+            10024: command_hint("库洛登录凭据校验失败，请重新发送 wt登录（10024）"),
             10014: "服务端正在处理另一项操作（10014）",
             70004: "当前没有可用宝箱（70004）",
             70005: "点击不足（70005）",

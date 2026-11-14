@@ -43,6 +43,7 @@ class Failures:
         self.path = root / "failure_state.json"
         self.state = FailureState()
         self._failures: dict[str, Failure] = {}
+        self.last_failure: tuple[float, str] | None = None
         self._lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
@@ -59,6 +60,15 @@ class Failures:
     def allows(self, key: str) -> bool:
         item = self._failures.get(key)
         return item is None or not item.blocked and item.retry_after <= time.time()
+
+    def cooldown_ready(self, key: str) -> bool:
+        return self.retry_after(key) <= time.time()
+
+    async def wake_notifications(self) -> None:
+        async with self._lock:
+            for key, item in self._failures.items():
+                if key == "notice_loop" or key.startswith(("notice-account:", "notice:")):
+                    item.retry_after = 0
 
     def attempts(self, key: str) -> int:
         item = self._failures.get(key)
@@ -106,17 +116,23 @@ class Failures:
         *,
         limit: int | None = None,
         delay: int | None = None,
+        blocked_delay: int | None = None,
     ) -> Failure:
         async with self._lock:
+            self.last_failure = time.time(), phase
             item = self._failures.setdefault(key, Failure(account_id=account_id))
             maximum = retry_limit() if limit is None else limit
             if item.blocked:
                 # blocked 只表示告警已发；巡检入口仍会冷却重试，这里续上冷却时间
-                item.retry_after = time.time() + self.delay(maximum)
+                item.retry_after = time.time() + (self.delay(maximum) if blocked_delay is None else blocked_delay)
+                if blocked_delay is not None:
+                    logger.warning(f"[WuwaTappoUID] 后台阶段 {key.split(':', 1)[0]} 冷却重试仍未恢复：{detail}")
                 return item.model_copy()
             item.attempts += 1
             item.blocked = item.attempts >= maximum
             item.retry_after = time.time() + (self.delay(item.attempts) if delay is None else delay)
+            if item.blocked and blocked_delay is not None:
+                item.retry_after = time.time() + blocked_delay
             target = f"CUID {mask_cuid(account_id.split(':', 1)[-1])}" if account_id else "插件"
             summary = f"{target} · {phase} · 连续后台异常 {item.attempts}/{maximum}"
             if item.blocked:

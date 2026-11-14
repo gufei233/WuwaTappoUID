@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from PIL import Image, ImageDraw
 
+from .command_text import command_hint
 from .render_common import (
     ACCENT,
     BG,
@@ -208,7 +209,7 @@ def render_account(
         deadline = "恢复后计算到期时间" if task.paused_at is not None else stamp(task.expires_at) + " 到期"
         text(draw, 838, top + 52, deadline, 15, SOFT, align="right", limit=236)
     else:
-        text(draw, 61, top + 52, "发送 wt宝箱 开启新任务", 16, SOFT)
+        text(draw, 61, top + 52, command_hint("发送 wt宝箱 开启新任务"), 16, SOFT)
     footer(draw, 705)
     return finish(canvas)
 

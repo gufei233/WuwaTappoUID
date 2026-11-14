@@ -24,6 +24,7 @@ from .render_cache import LocalImage, render_in_thread
 from .render_common import Header, Progress
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
+from .role_names import resolve_roles
 from .schema import ApiError, Item, NetworkError, OpenResult, SynthesisResult, UserInfo, WuwaError
 from .statistics import CHINA, ChestStatistics, StatisticsPeriod
 from .statistics_card import render_statistics
@@ -399,10 +400,7 @@ class Cards:
         roles = dict(self._bundled_roles)
         if self.resources.dictionary is not None:
             roles.update(self.resources.dictionary.character)
-        found = {key for key, value in roles.items() if value == name}
-        if not found:
-            raise WuwaError(f"未找到角色“{name}”，请使用完整角色名，例如 角色=今汐。")
-        return found
+        return resolve_roles(name, roles)
 
     def in_scope(self, item: Item, rarity: str | None, roles: set[str] | None) -> bool:
         if rarity:

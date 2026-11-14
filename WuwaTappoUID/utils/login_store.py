@@ -7,6 +7,7 @@ from gsuid_core.utils.database.base_models import with_session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import Account, AccountLink, Binding, LoginSession, Notice
+from .diagnostics import timed
 from .schema import SdkLogin, UserInfo
 
 
@@ -16,6 +17,7 @@ def digest(value: str) -> str:
 
 class LoginStore:
     @classmethod
+    @timed("login-write", slow=2)
     @with_session
     async def confirm_external(cls, session: AsyncSession, expected: LoginSession) -> bool:
         row = await session.get(LoginSession, expected.id)
@@ -53,6 +55,7 @@ class LoginStore:
         return True
 
     @classmethod
+    @timed("login-write", slow=2)
     @with_session
     async def token(
         cls,
@@ -100,6 +103,7 @@ class LoginStore:
         return True
 
     @classmethod
+    @timed("login-write", slow=2)
     @with_session
     async def bind(cls, session: AsyncSession, key: str, token_digest: str, info: UserInfo, expires_at: float) -> bool:
         row = await session.get(LoginSession, key)
@@ -118,6 +122,7 @@ class LoginStore:
         return True
 
     @classmethod
+    @timed("login-write", slow=2)
     @with_session
     async def outcome(
         cls,

@@ -11,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 
 from ..runtime import login, owner, service
+from ..utils.command_text import command_hint, command_text
 from ..utils.login_config import SDK_CONFIG
 from ..utils.schema import SdkLogin, WuwaError
 
@@ -27,9 +28,13 @@ class LoginInput(BaseModel):
 def render_page(auth: str, result: dict) -> HTMLResponse:
     target = result.get("data", {}).get("binding_target", "")
     binding = (
-        f"绑定至：{target}。请确认是本人账号，请勿使用他人的链接。" if target else "请重新发送 wt登录 获取有效链接。"
+        f"绑定至：{target}。请确认是本人账号，请勿使用他人的链接。"
+        if target
+        else command_hint("请重新发送 wt登录 获取有效链接。")
     )
-    initial = json.dumps({"auth": auth, "sdk_config": SDK_CONFIG, **result}, ensure_ascii=False).replace("<", "\\u003c")
+    initial = json.dumps(
+        {"auth": auth, "sdk_config": SDK_CONFIG, "login_command": command_text("登录"), **result}, ensure_ascii=False
+    ).replace("<", "\\u003c")
     page = LOGIN_TEMPLATE
     page = page.replace("__WT_BINDING_TARGET__", escape(binding)).replace("__WT_BOOTSTRAP__", initial)
     return HTMLResponse(page, headers=PAGE_HEADERS)

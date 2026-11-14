@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from .command_text import command_hint
 from .schema import DataError, Item, WuwaError
 
 KINDS = ("character_skin", "accessory", "emote")
@@ -27,7 +28,7 @@ class SynthesisOptions:
             elif word in KIND_ARGUMENTS and result.kind is None:
                 result.kind = KIND_ARGUMENTS[word]
             else:
-                raise WuwaError(USAGE)
+                raise WuwaError(command_hint(USAGE))
         return result
 
     @property

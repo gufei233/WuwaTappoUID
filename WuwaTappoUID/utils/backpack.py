@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from .command_text import command_hint
 from .schema import WuwaError
 
 KINDS = {"角色": "character", "配件": "accessory", "表情": "emote"}
@@ -29,7 +30,7 @@ class BagFilter:
             elif word == "重复" and not result.duplicates:
                 result.duplicates = True
             else:
-                raise WuwaError(USAGE)
+                raise WuwaError(command_hint(USAGE))
         return result
 
     @property

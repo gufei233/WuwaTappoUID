@@ -23,6 +23,7 @@ from .utils.resources import Resources
 from .utils.schema import DatabaseSchemaError, DataError, MaintenanceError, SessionImport, WuwaError, token_expiry
 from .utils.service import Service, account_id, identity
 from .utils.settings import retry_limit
+from .utils.status import register_status_panel
 
 ROOT = get_res_path("WuwaTappoUID")
 api = WuwaAPI()
@@ -33,8 +34,6 @@ owner = RuntimeOwner(service, api, resources, login)
 NOTICE_JOB = "WuwaTappoUID:notice"
 MAINTAIN_JOB = "WuwaTappoUID:maintain"
 RESOURCE_JOB = "WuwaTappoUID:resources"
-LOGIN_JOB = "WuwaTappoUID:login"
-LOCAL_LOGIN_JOB = "WuwaTappoUID:login-local"
 HISTORY_JOB = "WuwaTappoUID:history"
 _initialize_lock = asyncio.Lock()
 _initialize_attempted = False
@@ -172,12 +171,11 @@ async def start_jobs() -> None:
     if not service.database_ready:
         logger.error("[WuwaTappoUID] 初始化未完成，不恢复宝箱任务；请检查首次启动异常。")
         return
+    register_status_panel(service)
     jobs = (
         (MAINTAIN_JOB, maintain, 60, "WuwaTappo 任务巡检"),
         (NOTICE_JOB, service.flush_notices, 60, "WuwaTappo 结果通知"),
         (HISTORY_JOB, service.archive_history, 60, "WuwaTappo 历史归档与清理"),
-        (LOCAL_LOGIN_JOB, login.poll_local, 1, "WuwaTappo 本地登录与结果补写"),
-        (LOGIN_JOB, login.poll_external, 3, "WuwaTappo 外置登录结果"),
     )
     for job_id, operation, seconds, name in jobs:
         scheduler.add_job(
@@ -199,6 +197,7 @@ async def start_jobs() -> None:
         misfire_grace_time=None,
     )
     try:
+        await login.restore_workers()
         await service.restore()
     except SQLAlchemyError as error:
         await service.disable_database(error)
@@ -210,6 +209,7 @@ async def maintain() -> None:
     if service.closing or not service.database_ready:
         return
     await login.maintain_sessions()
+    await login.restore_workers()
     await service.maintain()
 
 
@@ -227,6 +227,7 @@ async def wt_start() -> None:
 async def wt_bot_connected() -> None:
     if owner.active:
         service.failures.wake_alerts()
+        await service.failures.wake_notifications()
         service.wake_notices()
 
 

@@ -5,6 +5,7 @@ from pydantic import BaseModel, ValidationError
 
 from .api import WuwaAPI
 from .database import LoginSession
+from .diagnostics import measure
 from .schema import DataError, NetworkError, SdkLogin, WuwaError
 
 
@@ -23,25 +24,26 @@ class RemoteResponse(BaseModel):
 
 
 async def request(api: WuwaAPI, base: str, path: str, payload: dict) -> RemoteData:
-    try:
-        async with api.client().post(
-            base + "/wuwatappouid/" + path,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=12),
-        ) as response:
-            if response.status >= 500 or response.status in (408, 429):
-                raise NetworkError(f"外置登录服务暂不可用（HTTP {response.status}）。")
-            if response.status != 200:
-                raise WuwaError(f"外置登录服务拒绝请求（HTTP {response.status}），请检查服务版本和配置。")
-            try:
-                result = RemoteResponse.model_validate_json(await response.text())
-            except ValidationError:
-                raise DataError("外置登录服务返回格式不正确，请确认部署了支持 WuwaTappoUID 的 ww-login。") from None
-    except (aiohttp.ClientError, TimeoutError):
-        raise NetworkError("无法连接外置登录服务，请检查服务地址和网络。") from None
-    if result.status != 0:
-        raise WuwaError(result.msg)
-    return result.data
+    with measure("login-http", label=path, debug=True):
+        try:
+            async with api.client().post(
+                base + "/wuwatappouid/" + path,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as response:
+                if response.status >= 500 or response.status in (408, 429):
+                    raise NetworkError(f"外置登录服务暂不可用（HTTP {response.status}）。")
+                if response.status != 200:
+                    raise WuwaError(f"外置登录服务拒绝请求（HTTP {response.status}），请检查服务版本和配置。")
+                try:
+                    result = RemoteResponse.model_validate_json(await response.text())
+                except ValidationError:
+                    raise DataError("外置登录服务返回格式不正确，请确认部署了支持 WuwaTappoUID 的 ww-login。") from None
+        except (aiohttp.ClientError, TimeoutError):
+            raise NetworkError("无法连接外置登录服务，请检查服务地址和网络。") from None
+        if result.status != 0:
+            raise WuwaError(result.msg)
+        return result.data
 
 
 async def create(api: WuwaAPI, base: str, platform: str, user_id: str) -> RemoteData:

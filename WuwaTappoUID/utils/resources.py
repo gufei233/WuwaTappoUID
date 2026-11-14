@@ -12,6 +12,7 @@ from gsuid_core.logger import logger
 from pydantic import BaseModel, ValidationError
 
 from .api import JSON, Download, WuwaAPI, parse
+from .command_text import command_hint
 from .item_image import render_tile
 from .render_cache import RenderConfig, render_in_thread
 from .schema import (
@@ -243,7 +244,7 @@ class Resources:
                     "emote": (self.manifest.emote_atlas, self.manifest.emote),
                 }
                 items = []
-                for entry in await self.api.atlas():
+                for entry in await self.api.atlas(fresh=True):
                     kind = entry.asset_type.removesuffix("_atlas")
                     if kind not in atlas_groups:
                         raise DataError("图鉴包含未识别的品类，保留原图鉴目录。")
@@ -265,8 +266,10 @@ class Resources:
                 raise
             except (WuwaError, OSError) as error:
                 problems.append(self._error("图鉴目录更新", error))
-            updated, skipped, failed, deferred = await self._sync_images(force)
-            messages.append(f"物品图：下载 {updated}，跳过 {skipped}，失败 {failed}，待补齐 {deferred}。")
+            updated, skipped, failed, deferred, repaired = await self._sync_images(force)
+            messages.append(
+                f"物品图：下载 {updated}（损坏修复 {repaired}），跳过 {skipped}，失败 {failed}，待补齐 {deferred}。"
+            )
             if failed or deferred:
                 problems.append("部分图片下载失败，后续普通更新会继续补齐。")
         if not problems:
@@ -303,7 +306,7 @@ class Resources:
         # 清单 URL 带版本参数；地址或版本变化就对应新文件，未变化的图片直接复用。
         return self.raw_dir / f"{hashlib.sha256(url.encode()).hexdigest()}.png"
 
-    async def _sync_images(self, force: bool) -> tuple[int, int, int, int]:
+    async def _sync_images(self, force: bool) -> tuple[int, int, int, int, int]:
         assert self.manifest is not None
         images = (*self.manifest.images().values(), *self.manifest.head_images().values())
         urls = sorted({self._image_url(relative) for relative in images})
@@ -315,8 +318,14 @@ class Resources:
             async with semaphore:
                 path = self._raw_path(url)
                 try:
+                    damaged = False
                     if not force and path.exists() and path.stat().st_size:
-                        return "skipped"
+                        try:
+                            await self.disk(self._verify_file, path)
+                        except DataError:
+                            damaged = True
+                        else:
+                            return "skipped"
                     # 连续失败后不再发起本轮剩余下载；在途请求正常收尾。
                     if consecutive_failures >= retry_limit():
                         return "deferred"
@@ -325,7 +334,7 @@ class Resources:
                     async with self.raw_cache_lock:
                         await self.disk(self._write_file, path, raw)
                     consecutive_failures = 0
-                    return "updated"
+                    return "repaired" if damaged else "updated"
                 except (WuwaError, OSError, ValueError) as error:
                     consecutive_failures += 1
                     if consecutive_failures == 1:
@@ -336,11 +345,17 @@ class Resources:
 
         results = await asyncio.gather(*(sync(url) for url in urls))
         return (
-            results.count("updated"),
+            results.count("updated") + results.count("repaired"),
             results.count("skipped"),
             results.count("failed"),
             results.count("deferred"),
+            results.count("repaired"),
         )
+
+    @staticmethod
+    def _verify_file(path: Path) -> None:
+        # 文件读写错误向外传播，只有图片内容错误才进入局部修复。
+        Resources._verify_image(path.read_bytes())
 
     @staticmethod
     def _verify_image(raw: bytes) -> None:
@@ -351,7 +366,7 @@ class Resources:
         try:
             with Image.open(BytesIO(raw)) as image:
                 image.verify()
-        except (OSError, ValueError):
+        except (OSError, ValueError, SyntaxError):
             raise DataError("远端物品图无法解析。") from None
 
     @staticmethod
@@ -364,7 +379,7 @@ class Resources:
     def _character_entry(self, character: DesktopCharacter) -> AssetEntry:
         manifest = self.manifest
         if manifest is None:
-            raise DataError("桌宠头像资源清单尚未加载，请发送 wt更新资源 后重试。")
+            raise DataError(command_hint("桌宠头像资源清单尚未加载，请发送 wt更新资源 后重试。"))
         key = str(character.id)
         if key not in manifest.character_skin and key in manifest.character_skin_atlas:
             key = str(manifest.character_skin_atlas[key].height_light_id)
@@ -384,7 +399,7 @@ class Resources:
             if item is not None:
                 entry = manifest.character_skin.get(str(item.asset_id))
         if entry is None:
-            raise DataError("当前桌宠角色未出现在资源清单中，请发送 wt更新资源 后重试。")
+            raise DataError(command_hint("当前桌宠角色未出现在资源清单中，请发送 wt更新资源 后重试。"))
         return entry
 
     async def character_head(self, character: DesktopCharacter) -> bytes:
@@ -406,7 +421,7 @@ class Resources:
                     logger.warning("[WuwaTappoUID] 本地头像缓存损坏，资源更新时重新下载。")
                 else:
                     return raw
-        raise DataError("本地角色图片尚未缓存，请发送 wt更新资源 补齐。")
+        raise DataError(command_hint("本地角色图片尚未缓存，请发送 wt更新资源 补齐。"))
 
     async def item_image(self, asset_id: str | int, rarity: str) -> bytes | None:
         """只读本地原图，推送过程不等待网络下载。"""

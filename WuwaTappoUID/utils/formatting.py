@@ -4,6 +4,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 
+from .command_text import command_hint
 from .database import ChestTask
 from .schema import SIDE_NAMES, UserInfo
 
@@ -52,7 +53,7 @@ def task_text(task: ChestTask | None) -> str:
     if task is None or task.status not in ("active", "paused"):
         return "自动开箱：未开启"
     if task.remaining(now) <= 0:
-        return "自动开箱：本轮已到期，发送 wt宝箱 开启新一轮"
+        return command_hint("自动开箱：本轮已到期，发送 wt宝箱 开启新一轮")
     state = "运行中" if task.status == "active" else f"已暂停（{PAUSE_REASONS.get(task.pause_reason, '已暂停')}）"
     deadline = "恢复后重新计算" if task.timer_paused else date_text(task.expires_at)
     return (

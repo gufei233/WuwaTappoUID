@@ -16,6 +16,7 @@ import aiohttp
 from gsuid_core.logger import logger
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
+from .diagnostics import measure
 from .schema import (
     BASE,
     CODE_OK,
@@ -131,6 +132,9 @@ def parse(model: type[T], data: object) -> T:
 class WuwaAPI:
     def __init__(self) -> None:
         self.session: aiohttp.ClientSession | None = None
+        self._atlas: list[Item] | None = None
+        self._atlas_until = 0.0
+        self._atlas_lock = asyncio.Lock()
         self._versions: dict[str, int] = {}
         self._requests: dict[str, AccountRequests] = {}
         self._socket_rooms: dict[str, str] = {}
@@ -244,6 +248,8 @@ class WuwaAPI:
     async def close(self) -> None:
         if self.session is not None:
             await self.session.close()
+        self._atlas = None
+        self._atlas_until = 0
         self._requests.clear()
         self._socket_rooms.clear()
         self._versions.clear()
@@ -283,44 +289,47 @@ class WuwaAPI:
         path = url.removeprefix(BASE).split("?", 1)[0]
         request_id = ""
         status = None
-        try:
-            async with self.client().request(method, url, json=payload, headers=headers) as response:
-                request_id = response.headers.get("x-request-id", "")
-                status = response.status
-                if status == 601:
-                    raise self._maintenance_error(path, request_id)
-                try:
-                    envelope = Envelope.model_validate_json(await response.text())
-                except ValidationError:
+        with measure("http", label=path, debug=True):
+            try:
+                async with self.client().request(method, url, json=payload, headers=headers) as response:
+                    request_id = response.headers.get("x-request-id", "")
+                    status = response.status
+                    if status == 601:
+                        raise self._maintenance_error(path, request_id)
+                    try:
+                        envelope = Envelope.model_validate_json(await response.text())
+                    except ValidationError:
+                        if response.status in (401, 403):
+                            raise ApiError(
+                                None, http_status=response.status, path=path, request_id=request_id
+                            ) from None
+                        if response.status >= 500 or response.status in (408, 429):
+                            raise NetworkError(
+                                f"服务端暂不可用（HTTP {response.status}）。",
+                                f"接口 {path}，HTTP {status}，请求ID {request_id or '未提供'}，无有效业务响应",
+                            ) from None
+                        raise DataError(f"接口 {path} 未返回有效业务响应（HTTP {response.status}）。") from None
+                    request_id = envelope.request_id or request_id
+                    if envelope.code not in CODE_OK:
+                        raise ApiError(envelope.code, http_status=response.status, path=path, request_id=request_id)
                     if response.status in (401, 403):
-                        raise ApiError(None, http_status=response.status, path=path, request_id=request_id) from None
+                        raise ApiError(None, http_status=response.status, path=path, request_id=request_id)
                     if response.status >= 500 or response.status in (408, 429):
                         raise NetworkError(
-                            f"服务端暂不可用（HTTP {response.status}）。",
-                            f"接口 {path}，HTTP {status}，请求ID {request_id or '未提供'}，无有效业务响应",
-                        ) from None
-                    raise DataError(f"接口 {path} 未返回有效业务响应（HTTP {response.status}）。") from None
-                request_id = envelope.request_id or request_id
-                if envelope.code not in CODE_OK:
-                    raise ApiError(envelope.code, http_status=response.status, path=path, request_id=request_id)
-                if response.status in (401, 403):
-                    raise ApiError(None, http_status=response.status, path=path, request_id=request_id)
-                if response.status >= 500 or response.status in (408, 429):
-                    raise NetworkError(
-                        f"服务端暂不可用（HTTP {response.status}），稍后再查询。",
-                        f"接口 {path}，HTTP {status}，业务码 {envelope.code}，请求ID {request_id or '未提供'}",
-                    )
-                if response.status >= 400:
-                    raise DataError(f"请求被拒绝（HTTP {response.status}），请管理员检查接口。")
-                if url == BASE + "/api/common/activity-config" and method == "GET":
-                    if self.maintenance:
-                        logger.info("[WuwaTappoUID] 官方服务维护结束，恢复业务请求。")
-                    self.maintenance = False
-                return envelope
-        except (aiohttp.ClientError, TimeoutError) as error:
-            raise NetworkError(
-                "网络请求失败或超时，暂时无法确认服务端结果。", network_details(path, error, status, request_id)
-            ) from None
+                            f"服务端暂不可用（HTTP {response.status}），稍后再查询。",
+                            f"接口 {path}，HTTP {status}，业务码 {envelope.code}，请求ID {request_id or '未提供'}",
+                        )
+                    if response.status >= 400:
+                        raise DataError(f"请求被拒绝（HTTP {response.status}），请管理员检查接口。")
+                    if url == BASE + "/api/common/activity-config" and method == "GET":
+                        if self.maintenance:
+                            logger.info("[WuwaTappoUID] 官方服务维护结束，恢复业务请求。")
+                        self.maintenance = False
+                    return envelope
+            except (aiohttp.ClientError, TimeoutError) as error:
+                raise NetworkError(
+                    "网络请求失败或超时，暂时无法确认服务端结果。", network_details(path, error, status, request_id)
+                ) from None
 
     async def download(self, url: str, limit: int = 4_000_000, *, etag: str = "", last_modified: str = "") -> Download:
         async def request() -> Download:
@@ -449,12 +458,18 @@ class WuwaAPI:
             cache.bags[cache_key] = items
         return items
 
-    async def atlas(self) -> list[Item]:
-        data = await self.request("/api/common/atlas", "GET")
-        try:
-            return ITEMS.validate_python(data)
-        except ValidationError:
-            raise DataError("图鉴响应格式已变化，无法确定各品类的最高合成阶级。") from None
+    async def atlas(self, *, fresh: bool = False) -> list[Item]:
+        async with self._atlas_lock:
+            if not fresh and self._atlas is not None and time.monotonic() < self._atlas_until:
+                return self._atlas
+            data = await self.request("/api/common/atlas", "GET")
+            try:
+                items = ITEMS.validate_python(data)
+            except ValidationError:
+                raise DataError("图鉴响应格式已变化，无法确定各品类的最高合成阶级。") from None
+            self._atlas = items
+            self._atlas_until = time.monotonic() + 1800
+            return items
 
     async def redeem(self, token: str, code: str) -> None:
         self.invalidate(token)

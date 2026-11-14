@@ -5,10 +5,11 @@ import hashlib
 import json
 import secrets
 import time
-from typing import Literal
+import traceback
+from collections.abc import Awaitable, Callable
+from typing import Literal, ParamSpec, TypeVar
 from urllib.parse import urlsplit
 
-from gsuid_core.aps import scheduler
 from gsuid_core.config import core_config
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
@@ -18,16 +19,20 @@ from pydantic import BaseModel, Field, JsonValue
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import login_remote
+from .command_text import command_hint
 from .database import LoginSession, Store
+from .diagnostics import measure
 from .formatting import mask_cuid
 from .login_card import render_login
 from .login_store import LoginStore
 from .render_cache import render_in_thread
-from .schema import CN_SERVER_ID, ApiError, DataError, SdkLogin, UserInfo, WuwaError, token_expiry
+from .schema import CN_SERVER_ID, ApiError, DataError, LoginData, SdkLogin, UserInfo, WuwaError, token_expiry
 from .service import Service, account_id, identity
 from .settings import retry_limit, settings
 
 LOGIN_TTL = 300
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 def session_key(state: str) -> str:
@@ -71,6 +76,129 @@ class LoginManager:
         self._remote_retries: dict[str, tuple[int, float]] = {}
         self._checkpoints: dict[str, PendingLoginCheckpoint] = {}
         self._processing: set[str] = set()
+        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._wake_events: dict[str, asyncio.Event] = {}
+        self._external_workers: set[str] = set()
+        self._network_slots = asyncio.Semaphore(4)
+
+    async def network(self, operation: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs) -> R:
+        with measure("login-queue", slow=2):
+            await self._network_slots.acquire()
+        try:
+            return await operation(*args, **kwargs)
+        finally:
+            self._network_slots.release()
+
+    def ensure_worker(self, key: str, *, external: bool = False) -> None:
+        if self.service.closing or not self.service.database_ready or not self.service.runtime.active:
+            return
+        if external:
+            self._external_workers.add(key)
+        task = self._workers.get(key)
+        if task is None or task.done():
+            self._wake_events[key] = asyncio.Event()
+            self._workers[key] = self.service.runtime.start_background(self._run_session, key)
+        else:
+            self._wake_events[key].set()
+
+    def stop_workers(self) -> None:
+        for event in self._wake_events.values():
+            event.set()
+
+    async def restore_workers(self) -> None:
+        if self.service.closing or not self.service.database_ready:
+            return
+        local = await Store.local_logins()
+        external = await Store.external_logins()
+        for row in local:
+            if row.id not in self._workers:
+                self.ensure_worker(row.id)
+        for row in external:
+            if row.id not in self._workers:
+                self.ensure_worker(row.id, external=True)
+        for key in tuple(self._checkpoints):
+            if key not in self._workers:
+                self.ensure_worker(key)
+
+    async def _run_session(self, key: str) -> None:
+        wake = self._wake_events[key]
+        try:
+            while not self.service.closing and self.service.database_ready:
+                wake.clear()
+                try:
+                    row = await Store.login_session(key)
+                    if row is None:
+                        self._checkpoints.pop(key, None)
+                        return
+                    with measure("login", label=key[:8]):
+                        delay = await self._session_step(row)
+                    await self.service.failures.success("login-worker:" + key)
+                    if delay is None:
+                        # 读取快照期间可能已有新的本地提交，先消费唤醒再退出。
+                        if wake.is_set():
+                            continue
+                        return
+                except SQLAlchemyError as error:
+                    await self.service.disable_database(error)
+                    return
+                except Exception as error:
+                    if self.service.failures.attempts("login-worker:" + key) == 0:
+                        frames = "".join(traceback.format_tb(error.__traceback__))
+                        logger.error(f"[WuwaTappoUID] 登录工作 {key[:8]} 异常：{type(error).__name__}\n{frames}")
+                    checkpoint = self._checkpoints.get(key)
+                    failure = await self.service.failures.fail(
+                        "login-worker:" + key,
+                        "登录工作",
+                        type(error).__name__,
+                        checkpoint.account_id if checkpoint is not None else "",
+                        blocked_delay=900,
+                    )
+                    delay = max(1, failure.retry_after - time.time())
+                if self.service.closing or not self.service.database_ready:
+                    return
+                try:
+                    async with asyncio.timeout(max(0.1, delay)):
+                        await wake.wait()
+                except TimeoutError:
+                    pass
+        finally:
+            self._workers.pop(key, None)
+            self._wake_events.pop(key, None)
+            self._external_workers.discard(key)
+            self._remote_retries.pop(key, None)
+
+    async def _session_step(self, row: LoginSession) -> float | None:
+        checkpoint = self._checkpoints.get(row.id)
+        if checkpoint is not None:
+            if checkpoint.retry_after > time.time():
+                return checkpoint.retry_after - time.time()
+            await self.poll_checkpoint_one(checkpoint)
+            return max(1, checkpoint.retry_after - time.time()) if row.id in self._checkpoints else 0.1
+        if row.external_url:
+            if row.external_synced:
+                return None
+            _, retry_after = self._remote_retries.get(row.id, (0, 0))
+            if retry_after > time.time() and row.expires_at > time.time():
+                return max(0.1, min(retry_after, row.expires_at) - time.time())
+            await self.poll_one(row)
+            if row.id in self._checkpoints:
+                return 0.1
+            _, retry_after = self._remote_retries.get(row.id, (0, 0))
+            delay = max(1, retry_after - time.time()) if retry_after else 3
+            return max(1, min(delay, row.expires_at - time.time()))
+        if row.expires_at <= time.time():
+            async with self.service.user_lock(row.owner_id):
+                await self.finish_due(await self.get_key(row.id))
+            return None
+        if not row.submission or row.status not in ("pending", "verifying"):
+            return None
+        failure_key = "login-local:" + row.id
+        if self.service.failures.blocked(failure_key):
+            return max(1, row.expires_at - time.time())
+        if not self.service.failures.cooldown_ready(failure_key):
+            return max(1, min(self.service.failures.retry_after(failure_key), row.expires_at) - time.time())
+        await self.poll_local_one(row)
+        return 1
 
     async def create(self, event: Event) -> list[str | bytes]:
         self.service.require_database()
@@ -94,13 +222,13 @@ class LoginManager:
             or address.query
             or address.fragment
         ):
-            raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
+            raise WuwaError(command_hint("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。"))
         owner = identity(event.bot_id, event.user_id)
         async with self.service.user_lock(owner):
             pending = next((item for item in self._checkpoints.values() if item.owner_id == owner), None)
             if pending is not None:
                 pending.retry_after = 0
-                self.wake_checkpoint()
+                self.wake_checkpoint(pending.key)
                 return ["已取得登录结果，正在等待数据库补写；不会重复登录，请稍后查看机器人通知。"]
             opened = await Store.open_logins(owner)
             if any(row.status == "processing" and row.expires_at > time.time() for row in opened):
@@ -108,7 +236,7 @@ class LoginManager:
             state = secrets.token_urlsafe(32)
             remote = None
             if not use_local:
-                remote = await login_remote.create(self.service.api, base, event.bot_id, event.user_id)
+                remote = await self.network(login_remote.create, self.service.api, base, event.bot_id, event.user_id)
                 state = remote.state
             key = session_key(state)
             async with self.service.subscription(event, "WuwaTappo登录", key) as subscription_id:
@@ -134,6 +262,11 @@ class LoginManager:
                     old.external_result_pending = False
                     self._remote_retries.pop(old.id, None)
                 await Store.save(*opened, row)
+                for old in opened:
+                    if old.id in self._wake_events:
+                        self._wake_events[old.id].set()
+        if remote is not None:
+            self.ensure_worker(key, external=True)
         url = base + "/wuwatappouid/i/" + state
         text = "请在5分钟内打开链接登录本人国服账号，请勿转发。\n" + url
         if not settings.get_config("login_send_qrcode").data:
@@ -152,7 +285,7 @@ class LoginManager:
         self.service.require_database()
         row = await Store.login_session(key)
         if row is None:
-            raise WuwaError("登录链接无效，请重新发送 wt登录。")
+            raise WuwaError(command_hint("登录链接无效，请重新发送 wt登录。"))
         return row
 
     async def finish_due(self, row: LoginSession) -> LoginSession:
@@ -166,7 +299,7 @@ class LoginManager:
                 self.wake_notices()
                 saved = await Store.login_session(row.id)
                 if saved is None:
-                    raise WuwaError("登录链接无效，请重新发送 wt登录。")
+                    raise WuwaError(command_hint("登录链接无效，请重新发送 wt登录。"))
                 return saved
         return row
 
@@ -202,13 +335,16 @@ class LoginManager:
             if row.external_url:
                 raise WuwaError("请在外置登录页面完成登录。")
             if row.status not in ("pending", "verifying", "processing", "success"):
-                raise WuwaError(row.message or "登录链接已失效，请重新发送 wt登录。")
+                raise WuwaError(row.message or command_hint("登录链接已失效，请重新发送 wt登录。"))
             if row.submission or row.status in ("processing", "success"):
+                if row.submission:
+                    self.ensure_worker(row.id)
                 return {"success": True}
             if row.status == "pending" and sdk is None:
                 raise WuwaError("请先登录库洛账号。")
             row.submission = sdk.model_dump_json() if row.status == "pending" else "null"
             await Store.save(row)
+        self.ensure_worker(row.id)
         return {"success": True}
 
     async def complete_key(self, key: str, sdk: SdkLogin | None) -> dict:
@@ -229,22 +365,33 @@ class LoginManager:
                     row.status = "processing"
                     row.submission = ""
                     await Store.save(row)
-                    roles = await self.service.api.login_roles(sdk)
-                    role = next(
-                        (
-                            item
-                            for item in roles.items
-                            if str(item.playerId).isdigit() and int(item.playerId) > 0 and item.serverId == CN_SERVER_ID
-                        ),
-                        None,
-                    )
                     target = account_id(sdk.cuid, 1)
                     async with self.service.account_lock(target):
                         if row.expires_at <= time.time() or self.service.closing:
-                            raise WuwaError("登录链接已到期或插件正在重载，请重新发送 wt登录。")
+                            raise WuwaError(command_hint("登录链接已到期或插件正在重载，请重新发送 wt登录。"))
+                        roles = await self.network(self.service.api.login_roles, sdk)
+                        role = next(
+                            (
+                                item
+                                for item in roles.items
+                                if str(item.playerId).isdigit()
+                                and int(item.playerId) > 0
+                                and item.serverId == CN_SERVER_ID
+                            ),
+                            None,
+                        )
+                        if row.expires_at <= time.time() or self.service.closing:
+                            raise WuwaError(command_hint("登录链接已到期或插件正在重载，请重新发送 wt登录。"))
                         account = await Store.account(target)
                         expected = session_key(account.token) if account is not None and account.token else ""
-                        result = await self.service.api.exchange_sdk_token(sdk, role, roles.channelId)
+
+                        async def exchange() -> LoginData:
+                            # 名额可能需要等待，真正交换前重新检查链接期限。
+                            if row.expires_at <= time.time() or self.service.closing:
+                                raise WuwaError(command_hint("登录链接已到期或插件正在重载，请重新发送 wt登录。"))
+                            return await self.service.api.exchange_sdk_token(sdk, role, roles.channelId)
+
+                        result = await self.network(exchange)
                         checkpoint = PendingLoginCheckpoint(
                             key=key,
                             owner_id=row.owner_id,
@@ -266,7 +413,7 @@ class LoginManager:
                     async with self.service.account_lock(row.account_id):
                         account = await Store.account(row.account_id)
                         if account is None or session_key(account.token) != row.token_digest:
-                            raise WuwaError("本次登录凭据已被更新，请重新发送 wt登录。")
+                            raise WuwaError(command_hint("本次登录凭据已被更新，请重新发送 wt登录。"))
                         checkpoint = PendingLoginCheckpoint(
                             key=key,
                             owner_id=row.owner_id,
@@ -303,7 +450,7 @@ class LoginManager:
                     phase="outcome",
                     outcome_status="failed",
                     message=str(error),
-                    notice_text=str(error) + "\n请重新发送 wt登录。",
+                    notice_text=str(error) + command_hint("\n请重新发送 wt登录。"),
                 )
                 self._checkpoints[key] = checkpoint
                 await self._continue_checkpoint(checkpoint)
@@ -318,8 +465,8 @@ class LoginManager:
                         cuid="",
                         phase="outcome",
                         outcome_status="failed",
-                        message="登录处理出现异常，请重新发送 wt登录。",
-                        notice_text="登录处理出现异常，已记录；请重新发送 wt登录。",
+                        message=command_hint("登录处理出现异常，请重新发送 wt登录。"),
+                        notice_text=command_hint("登录处理出现异常，已记录；请重新发送 wt登录。"),
                     )
                     self._checkpoints[key] = checkpoint
                     await self._continue_checkpoint(checkpoint)
@@ -367,7 +514,7 @@ class LoginManager:
                     await self._superseded(checkpoint)
                     return
                 try:
-                    info = await self.service.api.me(checkpoint.token, fresh=True)
+                    info = await self.network(self.service.api.me, checkpoint.token, fresh=True)
                     if (
                         str(info.cuid) != checkpoint.cuid
                         or info.is_domestic is not None
@@ -386,7 +533,7 @@ class LoginManager:
                     checkpoint.notice_text = str(error) + (
                         "\n请重新打开原链接，点击继续登录。"
                         if checkpoint.outcome_status == "verifying"
-                        else "\n请重新发送 wt登录。"
+                        else command_hint("\n请重新发送 wt登录。")
                     )
                     checkpoint.phase = "outcome"
                 else:
@@ -401,13 +548,13 @@ class LoginManager:
                 assert account is not None
                 # 绑定已提交后先保留最终结果，后续保存失败不重复恢复任务。
                 checkpoint.message = "登录成功，已绑定为当前账号。"
-                checkpoint.notice_text = checkpoint.message + "\n任务恢复尚未完成，可发送 wt恢复。"
+                checkpoint.notice_text = checkpoint.message + command_hint("\n任务恢复尚未完成，可发送 wt恢复。")
                 checkpoint.result = json.dumps(
                     {
                         "cuid": mask_cuid(account.cuid),
                         "region": "国服",
                         "player_name": checkpoint.info.display_name,
-                        "task_note": "任务恢复尚未完成，可发送 wt恢复。",
+                        "task_note": command_hint("任务恢复尚未完成，可发送 wt恢复。"),
                     },
                     ensure_ascii=False,
                 )
@@ -416,11 +563,15 @@ class LoginManager:
                 try:
                     note = await self.service.resume_after_token(account, checkpoint.info)
                 except (DatabaseWriteTimeout, WriteGateTimeout, SQLAlchemyError, WuwaError) as error:
-                    note = "登录成功，但任务尚未恢复：" + self.service.error_detail(error) + "；可稍后用 wt恢复。"
+                    note = (
+                        "登录成功，但任务尚未恢复："
+                        + self.service.error_detail(error)
+                        + command_hint("；可稍后用 wt恢复。")
+                    )
                 if checkpoint.expiry_error:
                     note += "\n登录态有效期格式异常，已保留新 token：" + checkpoint.expiry_error
                 note += (
-                    "\n已保存本人的SDK恢复凭据，可在有效期内发送 wt恢复 重新登录。"
+                    command_hint("\n已保存本人的SDK恢复凭据，可在有效期内发送 wt恢复 重新登录。")
                     if account.can_recover(row.owner_id)
                     else "\n本次登录未启用免验证码恢复；使用外置登录时请更新ww-login。"
                 )
@@ -469,7 +620,7 @@ class LoginManager:
         checkpoint.sdk = None
         checkpoint.phase = "outcome"
         checkpoint.outcome_status = "failed"
-        checkpoint.message = "本次登录凭据已被更新，本次未覆盖新登录态，请重新发送 wt登录。"
+        checkpoint.message = command_hint("本次登录凭据已被更新，本次未覆盖新登录态，请重新发送 wt登录。")
         checkpoint.result = "{}"
         checkpoint.notice_text = checkpoint.message
         checkpoint.expire_account = False
@@ -477,14 +628,8 @@ class LoginManager:
         self._checkpoints.pop(checkpoint.key, None)
         self.wake_notices()
 
-    def wake_checkpoint(self) -> None:
-        if self.service.closing:
-            return
-        job = scheduler.get_job("WuwaTappoUID:login-local")
-        if job is not None:
-            from datetime import datetime, timezone
-
-            job.modify(next_run_time=datetime.now(timezone.utc))
+    def wake_checkpoint(self, key: str) -> None:
+        self.ensure_worker(key)
 
     def wake_notices(self) -> None:
         self.service.wake_notices()
@@ -515,44 +660,28 @@ class LoginManager:
                 if snapshot.id not in self._checkpoints:
                     await Store.cleanup_login(snapshot.id, time.time())
 
-    async def poll_checkpoints(self) -> None:
-        for checkpoint in tuple(self._checkpoints.values()):
-            if self.service.closing:
-                return
-            if checkpoint.retry_after > time.time() or self.service.user_lock(checkpoint.owner_id).locked():
-                continue
-            if self.service.account_lock(checkpoint.account_id).locked():
-                continue
-            async with self.service.user_lock(checkpoint.owner_id):
-                async with self.service.account_lock(checkpoint.account_id):
-                    try:
-                        await self._continue_checkpoint(checkpoint)
-                    except SQLAlchemyError:
-                        raise
-                    except Exception as error:
-                        if self.service.failures.attempts("login-write:" + checkpoint.key) == 0:
-                            logger.exception("[WuwaTappoUID] 登录补写出现程序异常，已保留结果")
-                        checkpoint.retry_after = time.time() + 900
-                        await self.service.failures.fail(
-                            "login-write:" + checkpoint.key,
-                            "登录结果补写",
-                            self.service.error_detail(error),
-                            checkpoint.account_id,
-                            limit=1,
-                        )
-
-    async def poll_local(self) -> None:
-        if not self.service.database_ready or self.service.closing:
+    async def poll_checkpoint_one(self, checkpoint: PendingLoginCheckpoint) -> None:
+        if self.service.user_lock(checkpoint.owner_id).locked():
             return
-        try:
-            await self.poll_checkpoints()
-            rows = await Store.local_logins()
-            results = await asyncio.gather(*(self.poll_local_one(row) for row in rows), return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-        except SQLAlchemyError as error:
-            await self.service.disable_database(error)
+        if self.service.account_lock(checkpoint.account_id).locked():
+            return
+        async with self.service.user_lock(checkpoint.owner_id):
+            async with self.service.account_lock(checkpoint.account_id):
+                try:
+                    await self._continue_checkpoint(checkpoint)
+                except SQLAlchemyError:
+                    raise
+                except Exception as error:
+                    if self.service.failures.attempts("login-write:" + checkpoint.key) == 0:
+                        logger.exception("[WuwaTappoUID] 登录补写出现程序异常，已保留结果")
+                    checkpoint.retry_after = time.time() + 900
+                    await self.service.failures.fail(
+                        "login-write:" + checkpoint.key,
+                        "登录结果补写",
+                        self.service.error_detail(error),
+                        checkpoint.account_id,
+                        limit=1,
+                    )
 
     async def poll_local_one(self, snapshot: LoginSession) -> None:
         failure_key = "login-local:" + snapshot.id
@@ -575,18 +704,6 @@ class LoginManager:
             phase = "本地登录写入超时" if write_timeout else "本地登录会话处理"
             detail = f"{snapshot.platform} 用户 {mask_cuid(snapshot.user_id)}：{self.service.error_detail(error)}"
             await self.service.failures.fail(failure_key, phase, detail, snapshot.account_id)
-
-    async def poll_external(self) -> None:
-        if not self.service.database_ready or self.service.closing:
-            return
-        try:
-            rows = await Store.external_logins()
-            results = await asyncio.gather(*(self.poll_one(row) for row in rows), return_exceptions=True)
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-        except SQLAlchemyError as error:
-            await self.service.disable_database(error)
 
     async def poll_one(self, snapshot: LoginSession) -> None:
         # 本地回调或另一轮认证持有用户锁时，不启动第二次认证。
@@ -614,7 +731,7 @@ class LoginManager:
             if row.status == "processing":
                 return
             if row.status in ("pending", "verifying") and not row.external_result_pending:
-                data = await login_remote.poll(self.service.api, row)
+                data = await self.network(login_remote.poll, self.service.api, row)
                 if not data.submitted:
                     self._remote_retries.pop(row.id, None)
                     return
@@ -625,7 +742,7 @@ class LoginManager:
                 self.wake_notices()
             else:
                 result = self.response(row)
-            await login_remote.confirm(self.service.api, row, result)
+            await self.network(login_remote.confirm, self.service.api, row, result)
             async with self.service.user_lock(row.owner_id):
                 if row.id not in self._checkpoints:
                     await LoginStore.confirm_external(row)

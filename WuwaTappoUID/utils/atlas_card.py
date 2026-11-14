@@ -5,8 +5,10 @@ import math
 from dataclasses import dataclass
 from functools import cache
 
+from gsuid_core.logger import logger
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageOps
 
+from .command_text import command_text
 from .render_cache import LocalImage, images
 from .render_common import (
     BG,
@@ -79,8 +81,11 @@ def composed_tile(item: AtlasItem, rarity: str) -> Image.Image:
                 tile.alpha_composite(
                     picture, ((tile.width - picture.width) // 2, s(-4) + (s(92) - picture.height) // 2)
                 )
-        except OSError:
-            pass
+        except OSError as error:
+            logger.warning(
+                f"[WuwaTappoUID] 图鉴物品图无法读取（{type(error).__name__}），"
+                f"使用占位图；请发送 {command_text('更新资源')} 修复。"
+            )
     tile.putalpha(ImageChops.multiply(tile.getchannel("A"), tile_mask()))
     if item.quantity == 0:
         gray = ImageOps.grayscale(tile).convert("RGBA")

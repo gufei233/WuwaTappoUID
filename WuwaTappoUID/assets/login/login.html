@@ -54,6 +54,7 @@
   "use strict";
   const initial = __WT_BOOTSTRAP__;
   const auth = initial.auth, config = initial.sdk_config;
+  const loginCommand = initial.login_command;
   const submitUrl = new URL("../login", location.href);
   const form = document.getElementById("loginForm"), phone = document.getElementById("phone"), code = document.getElementById("code");
   const button = document.getElementById("loginButton"), codeButton = document.getElementById("codeButton"), message = document.getElementById("message");
@@ -146,9 +147,9 @@
     if (sessionStatus === "success" || sessionStatus === "processing") {accepted();return;}
     if (sessionStatus === "verifying") {button.disabled = false;button.textContent = "继续登录";show(initial.msg,true);}
     else if (sessionStatus === "pending") {enableInputs(true);button.disabled = false;}
-    else {form.hidden = true;show(initial.msg || "链接已失效，请重新发送 wt登录。",true);return;}
+    else {form.hidden = true;show(initial.msg || `链接已失效，请重新发送 ${loginCommand}。`,true);return;}
     expiryTimer = setInterval(() => {
-      if (Date.now() >= initial.data.expires_at && !busy) {enableInputs(false);button.disabled = true;show("链接已过期，请重新发送 wt登录。",true);clearInterval(expiryTimer);}
+      if (Date.now() >= initial.data.expires_at && !busy) {enableInputs(false);button.disabled = true;show(`链接已过期，请重新发送 ${loginCommand}。`,true);clearInterval(expiryTimer);}
     },1000);
   }
   initialize();

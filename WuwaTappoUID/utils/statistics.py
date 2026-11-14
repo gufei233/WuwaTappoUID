@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
+from .command_text import command_hint
 from .schema import DataError, OpenResult, WuwaError
 
 CHINA = timezone(timedelta(hours=8))
@@ -34,7 +35,7 @@ class StatisticsPeriod:
     def parse(cls, argument: str) -> "StatisticsPeriod":
         value = argument or "7天"
         if value not in ("今天", "7天", "30天", "全部"):
-            raise WuwaError("用法：wt开箱统计 [今天/7天/30天/全部]；不带参数查询最近7天。")
+            raise WuwaError(command_hint("用法：wt开箱统计 [今天/7天/30天/全部]；不带参数查询最近7天。"))
         now = datetime.now(CHINA)
         if value == "全部":
             return cls("全部", 0, now.timestamp())

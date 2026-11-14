@@ -1,6 +1,7 @@
 """跨插件热重载保存实例归属，等待在途操作收尾后交接。"""
 
 import asyncio
+import traceback
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from functools import wraps
@@ -11,6 +12,7 @@ from gsuid_core.logger import logger
 from gsuid_core.webconsole.app_app import app
 from pydantic import JsonValue
 
+from .diagnostics import current_diagnostics
 from .schema import WuwaError
 
 if TYPE_CHECKING:
@@ -102,6 +104,7 @@ class RuntimeOwner:
         self.accepting = False
         self.service.closing = True
         self.api.stopping = True
+        self.login.stop_workers()
         if slot.current is self:
             for job in scheduler.get_jobs():
                 if job.id.startswith("WuwaTappoUID:"):
@@ -122,26 +125,56 @@ class RuntimeOwner:
     async def _run_registered(
         self, operation: Callable[P, Awaitable[R]], *args: P.args, cancellable: bool = False, **kwargs: P.kwargs
     ) -> R:
+        task = self._create_task(operation, *args, cancellable=cancellable, **kwargs)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def _create_task(
+        self, operation: Callable[P, Awaitable[R]], *args: P.args, cancellable: bool = False, **kwargs: P.kwargs
+    ) -> asyncio.Task[R]:
         async def invoke() -> R:
             token = _current.set(self)
+            diagnostic_token = current_diagnostics.set(self.service.diagnostics)
             try:
                 return await operation(*args, **kwargs)
             finally:
+                current_diagnostics.reset(diagnostic_token)
                 _current.reset(token)
 
         task = asyncio.create_task(invoke())
         self.tasks.add(task)
         if cancellable:
             self.read_tasks.add(task)
-        try:
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                await asyncio.gather(task, return_exceptions=True)
-                raise
-        finally:
-            self.tasks.discard(task)
-            self.read_tasks.discard(task)
+
+        def finished(done: asyncio.Task[R]) -> None:
+            self.tasks.discard(done)
+            self.read_tasks.discard(done)
+
+        task.add_done_callback(finished)
+        return task
+
+    def start_background(
+        self, operation: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
+    ) -> asyncio.Task[R]:
+        if not self.active:
+            raise WuwaError("插件正在重新加载，请稍后重试。")
+        # 后台创建必须显式登记，不能依赖继承的 _current 上下文。
+        task = self._create_task(operation, *args, **kwargs)
+
+        def report(done: asyncio.Task[R]) -> None:
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                # 只输出源码位置，不格式化异常输入或捕获的局部凭据。
+                frames = "".join(traceback.format_tb(error.__traceback__))
+                logger.error(f"[WuwaTappoUID] 后台任务异常：{type(error).__name__}\n{frames}")
+
+        task.add_done_callback(report)
+        return task
 
     def entry(self, operation: Callable[P, Awaitable[R]], *, cancellable: bool = False) -> Callable[P, Awaitable[R]]:
         @wraps(operation)

@@ -10,6 +10,8 @@ from typing import TypeVar
 
 from PIL import Image
 
+from .command_text import command_prefix, current_prefix
+from .diagnostics import MeasuredLock, measure
 from .settings import bot_name, chest_task_hours, max_click_increment, settings
 
 T = TypeVar("T")
@@ -26,11 +28,15 @@ class RenderConfig:
     bot_name: str
     click_limit: int
     task_hours: int
+    prefix: str = "wt"
 
     @classmethod
     def capture(cls) -> "RenderConfig":
         return cls(
-            bot_name(), settings.get_config("max_click_increment").data, settings.get_config("chest_task_hours").data
+            bot_name(),
+            settings.get_config("max_click_increment").data,
+            settings.get_config("chest_task_hours").data,
+            command_prefix(),
         )
 
 
@@ -66,24 +72,27 @@ class ImageCache:
 
 
 images = ImageCache()
-render_lock = asyncio.Lock()
+render_lock = MeasuredLock("render-queue")
 
 
 async def render_in_thread(operation: Callable[..., T], *args, config: RenderConfig | None = None) -> T:
     snapshot = config or RenderConfig.capture()
     async with render_lock:
         token = current_config.set(snapshot)
+        prefix_token = current_prefix.set(snapshot.prefix)
         try:
             # 取消调用方时仍等工作线程结束，避免提前释放锁后并行绘制大图。
-            worker = asyncio.create_task(asyncio.to_thread(operation, *args))
-            try:
-                return await asyncio.shield(worker)
-            except asyncio.CancelledError:
+            with measure("render"):
+                worker = asyncio.create_task(asyncio.to_thread(operation, *args))
                 try:
-                    await worker
-                finally:
-                    raise
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    try:
+                        await worker
+                    finally:
+                        raise
         finally:
+            current_prefix.reset(prefix_token)
             current_config.reset(token)
 
 
@@ -94,7 +103,7 @@ class HelpImageCache:
         self.lock = asyncio.Lock()
 
     async def get(self, prefix: str, renderer: Callable[[str], bytes]) -> bytes:
-        config = RenderConfig(bot_name(), max_click_increment(), chest_task_hours())
+        config = RenderConfig(bot_name(), max_click_increment(), chest_task_hours(), prefix)
         key = (prefix, config)
         async with self.lock:
             if key != self.key:
