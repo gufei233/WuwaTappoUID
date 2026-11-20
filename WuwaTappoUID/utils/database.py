@@ -161,8 +161,8 @@ class ChestRecord(SQLModel, table=True):
     subscription_id: int = Field(index=True)
     side: str = Field(max_length=8)
     created_at: float = Field(default_factory=time.time)
-    state: str = Field(default="sending", index=True, max_length=16)
-    before_info: str = Field(sa_column=Column(Text, nullable=False))
+    state: str = Field(default="success", index=True, max_length=16)
+    before_info: str = Field(default="", sa_column=Column(Text, nullable=False))
     result: str = Field(default="", sa_column=Column(Text, nullable=False))
     fresh: bool = False
     supplement: str = Field(default="", sa_column=Column(Text, nullable=False))
@@ -728,39 +728,6 @@ class Store:
     @with_read_session
     async def active_tasks(cls, session: AsyncSession) -> list[ChestTask]:
         result = await session.execute(select(ChestTask).where(col(ChestTask.status).in_(["active", "paused"])))
-        return list(result.scalars().all())
-
-    @classmethod
-    @with_read_session
-    async def unresolved_accounts(cls, session: AsyncSession) -> list[str]:
-        result = await session.execute(
-            select(col(ChestRecord.account_id)).where(col(ChestRecord.state).in_(["sending", "uncertain"])).distinct()
-        )
-        return list(result.scalars().all())
-
-    @classmethod
-    @with_read_session
-    async def unresolved(cls, session: AsyncSession, account_id: str) -> list[ChestRecord]:
-        result = await session.execute(
-            select(ChestRecord)
-            .where(col(ChestRecord.account_id) == account_id, col(ChestRecord.state).in_(["sending", "uncertain"]))
-            .order_by(col(ChestRecord.created_at))
-        )
-        return list(result.scalars().all())
-
-    @classmethod
-    @with_read_session
-    async def recent_chests(cls, session: AsyncSession, account_id: str, run_id: str, side: str) -> list[ChestRecord]:
-        result = await session.execute(
-            select(ChestRecord)
-            .where(
-                col(ChestRecord.account_id) == account_id,
-                col(ChestRecord.run_id) == run_id,
-                col(ChestRecord.side) == side,
-            )
-            .order_by(col(ChestRecord.created_at).desc(), col(ChestRecord.id).desc())
-            .limit(4)
-        )
         return list(result.scalars().all())
 
     @classmethod

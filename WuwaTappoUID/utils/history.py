@@ -6,10 +6,9 @@ from datetime import datetime
 from gsuid_core.utils.database.base_models import with_session
 from sqlalchemy import and_, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 from sqlmodel import col, select
 
-from .database import ChestRecord, ChestSummary, ChestTask, Notice, SynthesisRecord
+from .database import ChestRecord, ChestSummary, Notice, SynthesisRecord
 from .schema import DataError
 from .statistics import CHINA, read_result
 
@@ -27,34 +26,6 @@ class HistoryArchive:
     @classmethod
     @with_session
     async def archive_batch(cls, session: AsyncSession, cutoff: float, daily_cutoff: float) -> ArchiveBatchResult:
-        current_run = (
-            select(ChestTask.account_id)
-            .where(
-                ChestTask.account_id == ChestRecord.account_id,
-                ChestTask.run_id == ChestRecord.run_id,
-                col(ChestTask.status).in_(["active", "paused"]),
-            )
-            .correlate(ChestRecord)
-            .exists()
-        )
-        later = aliased(ChestRecord)
-        # 与recent_chests的排序一致：只归档当前有效任务每侧最近4条以外的流水。
-        four_later = (
-            select(later.id)
-            .where(
-                later.account_id == ChestRecord.account_id,
-                later.run_id == ChestRecord.run_id,
-                later.side == ChestRecord.side,
-                or_(
-                    later.created_at > ChestRecord.created_at,
-                    and_(later.created_at == ChestRecord.created_at, later.id > ChestRecord.id),
-                ),
-            )
-            .offset(3)
-            .limit(1)
-            .correlate(ChestRecord)
-            .exists()
-        )
         delivered = (
             select(Notice.id)
             .where(Notice.id == ChestRecord.notice_id, col(Notice.delivery_state).in_(["submitted", "unroutable"]))
@@ -64,10 +35,7 @@ class HistoryArchive:
         completed_notice = or_(ChestRecord.notice_id == "legacy", delivered)
         eligible = or_(
             and_(ChestRecord.state == "success", completed_notice),
-            and_(
-                col(ChestRecord.state).in_(["rejected", "not_sent", "not_applied", "retry_exhausted"]),
-                or_(ChestRecord.notice_id == "", completed_notice),
-            ),
+            ChestRecord.state != "success",
         )
         result = await session.execute(
             select(ChestRecord)
@@ -75,7 +43,6 @@ class HistoryArchive:
                 ChestRecord.created_at < cutoff,
                 ChestRecord.archive_error == "",
                 eligible,
-                or_(~current_run, four_later),
             )
             .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
             .limit(BATCH_SIZE)

@@ -56,7 +56,7 @@ _READ_VERSIONS = count(1)
 @dataclass
 class AccountRequests:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    finished_at: float = 0
+    last_click_at: float = 0
 
 
 @dataclass
@@ -178,7 +178,7 @@ class WuwaAPI:
         key = "token:" + self._read_key(token)[0]
         previous = self._requests.get(key)
         if previous is not None:
-            activity.finished_at = max(activity.finished_at, previous.finished_at)
+            activity.last_click_at = max(activity.last_click_at, previous.last_click_at)
         self._requests[key] = activity
 
     @asynccontextmanager
@@ -190,8 +190,8 @@ class WuwaAPI:
             return
         activity = self.account_requests(token, cuid)
         async with activity.lock:
-            if clicks:
-                delay = activity.finished_at + CLICK_INTERVAL - time.monotonic()
+            if clicks and activity.last_click_at > 0:
+                delay = activity.last_click_at + CLICK_INTERVAL - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)
                 if expires_at is not None and time.time() >= expires_at:
@@ -199,7 +199,8 @@ class WuwaAPI:
             try:
                 yield
             finally:
-                activity.finished_at = time.monotonic()
+                if clicks:
+                    activity.last_click_at = time.monotonic()
 
     def _read_key(self, token: str) -> tuple[str, int]:
         key = hashlib.sha256(token.encode()).hexdigest()
@@ -486,7 +487,7 @@ class WuwaAPI:
         self.invalidate(token)
         return parse(
             OpenResult,
-            # 开箱由 Service 根据持久化流水确认结果后重试，不能在 HTTP 层直接重发。
+            # 开箱涉及冷却与点击消耗，超时或响应异常时不能在 HTTP 层直接重发。
             await self.request(
                 "/api/frontend/chests/open", payload={"place": side, "click_num": total}, token=token, retry=False
             ),

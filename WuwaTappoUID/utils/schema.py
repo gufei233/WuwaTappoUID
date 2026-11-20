@@ -18,8 +18,8 @@ TOKEN_RENEW_RETRY = 5 * 60
 TOKEN_EXPIRED_MESSAGE = "token已过期，请发送 wt登录，或使用 wt添加token TOKEN 更新。"
 RENEW_WINDOW = 60 * 60
 AUTO_CLICKS = 10_000
-# 请求发出这么久后该侧冷却仍未推进，就判定那次开箱没有生效（HTTP 超时为 25 秒）。
-SETTLE_SECONDS = 120
+CHEST_CLICK_COST = 1_000
+CHEST_COOLDOWN = 30 * 60
 SIDE_NAMES = {"left": "左", "right": "右"}
 Side = Literal["left", "right"]
 
@@ -47,9 +47,12 @@ class ApiError(WuwaError):
             90002: "账号已在其他设备登录（90002）",
             10024: command_hint("库洛登录凭据校验失败，请重新发送 wt登录（10024）"),
             10014: "服务端正在处理另一项操作（10014）",
+            70003: "客户端点击数异常（70003）",
             70004: "当前没有可用宝箱（70004）",
             70005: "点击不足（70005）",
             70006: "宝箱仍在冷却（70006）",
+            80013: "点击上报过于频繁（80013）",
+            80022: "上报点击数小于服务端当前累计值（80022）",
             50002: "合成失败（50002）",
             50006: "未拥有该物品（50006）",
             60002: "兑换失败（60002）",
@@ -181,6 +184,30 @@ class UserInfo(BaseModel):
     def cooldown(self, side: Side) -> float:
         ms = self.left_treasure_chest if side == "left" else self.right_treasure_chest
         return ms / 1000
+
+    def set_cooldown(self, side: Side, ready_at: float) -> None:
+        ms = int(ready_at * 1000)
+        if side == "left":
+            self.left_treasure_chest = max(self.left_treasure_chest, ms)
+        else:
+            self.right_treasure_chest = max(self.right_treasure_chest, ms)
+
+    def merge_monotonic(self, local: "UserInfo") -> "UserInfo":
+        if str(self.cuid) != str(local.cuid):
+            return self
+        return self.model_copy(
+            update={
+                "total_click_count": max(self.total_click_count, local.total_click_count),
+                "total_click_consume": max(self.total_click_consume, local.total_click_consume),
+                "left_treasure_chest": max(self.left_treasure_chest, local.left_treasure_chest),
+                "right_treasure_chest": max(self.right_treasure_chest, local.right_treasure_chest),
+            }
+        )
+
+    def merge_saved(self, raw: str) -> "UserInfo":
+        if not raw:
+            return self
+        return self.merge_monotonic(UserInfo.model_validate_json(raw))
 
 
 class Item(BaseModel):

@@ -34,11 +34,12 @@ from .render_common import Progress
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
+    CHEST_CLICK_COST,
+    CHEST_COOLDOWN,
     CN_SERVER_ID,
     CODE_OK,
     NET_SERVER_IDS,
     RENEW_WINDOW,
-    SETTLE_SECONDS,
     SIDE_NAMES,
     TOKEN_EXPIRED_MESSAGE,
     TOKEN_LIFETIME,
@@ -185,19 +186,13 @@ class Service:
         return str(error) if isinstance(error, WuwaError) else type(error).__name__
 
     async def task_failure(self, task: ChestTask, error: Exception) -> None:
-        already_paused = task.status == "paused"
         failure = await self.failures.fail(
             "check:" + task.account_id,
-            "开箱请求重试耗尽" if already_paused else "后台开箱检查",
+            "后台开箱检查",
             self.error_detail(error),
             task.account_id,
-            limit=1 if already_paused else None,
         )
         if failure.blocked:
-            if already_paused:
-                # 开箱重试耗尽的通知已由 open_side 保存，只补主人告警。
-                await Store.save(task)
-                return
             task.status = "paused"
             task.pause_reason = "failure"
             await Store.save(
@@ -352,8 +347,8 @@ class Service:
         summary = account_text(info, account.domestic)
         return ["账号数据已取得，图片暂不可用。\n" + summary + "\n" + task_text(task)]
 
-    async def refresh(self, account: Account, *, fresh: bool = False) -> UserInfo:
-        # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 为准。
+    async def refresh(self, account: Account, *, fresh: bool = False, force_remote: bool = False) -> UserInfo:
+        # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 和本地快照为准。
         saved = await Store.account(account.id)
         if saved is not None:
             account.token = saved.token
@@ -384,6 +379,8 @@ class Service:
             raise DataError("服务端返回的 CUID 与绑定账号不一致，已停止本次操作。")
         if info.is_domestic is not None and info.is_domestic != account.domestic:
             raise DataError("服务端返回的区服与绑定账号不一致，已停止本次操作。")
+        if not force_remote:
+            info = info.merge_saved(account.info)
         account.info = info.model_dump_json()
         account.verified_at = time.time()
         account.token_state = "ready"
@@ -408,13 +405,8 @@ class Service:
             account.token_renew_after = now + TOKEN_RENEW_RETRY
             await Store.save(account)
             if isinstance(error, ApiError) and error.is_auth:
-                try:
-                    await self.api.me(account.token, fresh=True)
-                except ApiError as confirmation:
-                    if confirmation.is_auth:
-                        await self.expire_account(account)
-                        raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
-                    raise
+                await self.expire_account(account)
+                raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
             if isinstance(error, ApiError) and error.code == 10014:
                 return
             reason = self.error_detail(error)
@@ -435,14 +427,6 @@ class Service:
             return "宝箱任务继续运行。"
         if task.pause_reason != "auth":
             return command_hint("宝箱任务保持暂停，可用 wt恢复 操作。")
-        if task.remaining() <= 0:
-            await self.finish(task, "expired", "本轮已到期")
-            return command_hint("宝箱任务已到期，请用 wt宝箱 开启新任务。")
-        try:
-            if not await self.reconcile(task, info):
-                return command_hint("登录成功，但任务尚未恢复：开箱结果仍待确认，可稍后用 wt恢复。")
-        except WuwaError as error:
-            return f"登录成功，但任务尚未恢复：{error}；可稍后用 {command_prefix()}恢复。"
         if task.remaining() <= 0:
             await self.finish(task, "expired", "本轮已到期")
             return command_hint("宝箱任务已到期，请用 wt宝箱 开启新任务。")
@@ -492,6 +476,7 @@ class Service:
                 account.token_state = "ready"
                 account.token_expires_at = 0
                 account.token_renew_after = 0
+                info = info.merge_saved(account.info)
                 account.info = info.model_dump_json()
                 account.verified_at = time.time()
                 await Store.save(
@@ -729,8 +714,8 @@ class Service:
         except ApiError as error:
             if not error.is_auth:
                 raise
-            await self.refresh(account, fresh=True)
-            raise
+            await self.expire_account(account)
+            raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
 
     async def redeem(self, event: Event, code: str) -> list[str | bytes]:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
@@ -742,7 +727,8 @@ class Service:
                     await self.api.redeem(account.token, code)
                 except ApiError as error:
                     if error.is_auth:
-                        await self.refresh(account, fresh=True)
+                        await self.expire_account(account)
+                        raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
                     raise
                 except MaintenanceError:
                     raise
@@ -820,30 +806,41 @@ class Service:
             raise Expired
 
     async def add_clicks(
-        self, account: Account, number: int, task: ChestTask | None = None
+        self,
+        account: Account,
+        number: int,
+        task: ChestTask | None = None,
+        current_info: UserInfo | None = None,
     ) -> tuple[UserInfo, int, str]:
-        before = await self.refresh(account)
+        before = current_info if current_info is not None else await self.refresh(account)
         self.check_deadline(task)
         if self.closing:
             return before, 0, "插件正在重新加载，本次未提交点击。"
+        target = before.total_click_count + number
         problem = ""
         submission_error = None
         try:
-            ack = await self.api.set_clicks(
-                account.token, before.total_click_count + number, task.expires_at if task is not None else None
-            )
-            if ack not in CODE_OK:
-                problem = str(ApiError(ack))
+            ack = await self.api.set_clicks(account.token, target, task.expires_at if task is not None else None)
+            if ack in CODE_OK:
+                after = before.model_copy(update={"total_click_count": target})
+                account.info = after.model_dump_json()
+                account.verified_at = time.time()
+                await Store.save(account)
+                return after, number, ""
+            problem = str(ApiError(ack))
         except OperationStopped as error:
             return before, 0, str(error)
         except ApiError as error:
+            if error.is_auth:
+                await self.expire_account(account)
+                raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
             if task is not None and error.code == 10014:
                 raise
             problem = str(error)
         except (NetworkError, DataError) as error:
             submission_error = error
             problem = str(error)
-        # 重连只提交固定目标累计值；最终仍按服务端实际变化作答。
+        # 仅在提交异常或返回非成功码（如 80022）时回读服务端值；保留单调合并避免冲掉刚推进的本地冷却。
         after = await self.refresh(account, fresh=True)
         delta = after.total_click_count - before.total_click_count
         if task is not None and delta <= 0 and submission_error is not None:
@@ -957,11 +954,6 @@ class Service:
                     await Store.save(task)
                     self.schedule(task)
                 else:
-                    if await Store.unresolved(account.id):
-                        assert task is not None
-                        info = await self.refresh(account)
-                        if not await self.reconcile(task, info):
-                            raise WuwaError("上轮开箱仍未能确认，已保留流水，请管理员核对后再开启。")
                     await self.refresh(account)
                     if not event.WS_BOT_ID:
                         raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存自动推送目标。")
@@ -986,55 +978,18 @@ class Service:
         return [answer, image]
 
     async def finish(self, task: ChestTask, status: str, reason: str) -> None:
-        # 先持久化结束状态并撤销调度，结果核对/汇总失败不能阻止任务停止。
+        # 先持久化结束状态并撤销调度，结果汇总失败不能阻止任务停止。
         task.status = status
         task.paused_at = None
         await Store.save(task)
         self.unschedule(task.account_id)
-        pending = await Store.unresolved(task.account_id)
-        expired_note = ""
-        if pending:
-            info: UserInfo | None = None
-            account = await Store.account(task.account_id)
-            if account is not None and account.token_state != "expired":
-                try:
-                    info = await self.api.me(account.token, fresh=True)
-                    if str(info.cuid) != account.cuid:
-                        raise DataError("结束任务核对的CUID与账号不一致。")
-                except MaintenanceError:
-                    pass
-                except WuwaError as error:
-                    if isinstance(error, ApiError) and error.is_auth:
-                        announced = await self.expire_account(account)
-                        await self.failures.success("reconcile:" + account.id)
-                        if not announced:
-                            expired_note = "\n" + self.expired_message(account, task.owner_id)
-                    elif isinstance(error, ApiError) and error.code == 10014:
-                        pass
-                    else:
-                        await self.failures.fail(
-                            "reconcile:" + account.id,
-                            "结束任务的结果核对",
-                            self.error_detail(error),
-                            account.id,
-                            limit=1 if isinstance(error, DataError) else None,
-                        )
-            if info is not None:
-                await self.reconcile(task, info)
-            else:
-                for record in pending:
-                    if record.result:
-                        await self.record_success(task, record)
-        unresolved_count = len(await Store.unresolved(task.account_id))
         await self.queue_results(task.account_id, force=True, reason=reason)
         await Store.save(
             task,
             Notice(
                 subscription_id=task.subscription_id,
                 account_id=task.account_id,
-                text=f"{reason}。本轮成功开箱 {task.successes} 个。"
-                + (f"另有 {unresolved_count} 个请求结果待确认，尚未计入。" if unresolved_count else "")
-                + expired_note,
+                text=f"{reason}。本轮成功开箱 {task.successes} 个。",
             ),
         )
 
@@ -1192,6 +1147,7 @@ class Service:
                     account.token_state = "expired"
                     await Store.save(account)
                     raise DataError("恢复结果的账号或区服不一致，本次未恢复任务。")
+                info = info.merge_saved(account.info)
                 account.info = info.model_dump_json()
                 account.verified_at = time.time()
                 account.token_state = "ready"
@@ -1209,11 +1165,6 @@ class Service:
                     self.failures.blocked("check:" + account.id) or self.failures.blocked("save:" + account.id)
                 ):
                     answer = prefix + "宝箱任务正在运行。"
-                elif not await self.reconcile(task, info):
-                    answer = prefix + command_hint("开箱结果仍待确认，任务保持暂停，可稍后再次 wt恢复。")
-                elif task.remaining() <= 0:
-                    await self.finish(task, "expired", "本轮已到期")
-                    answer = prefix + command_hint("原任务已到期，可发送 wt宝箱 开启新任务。")
                 else:
                     route = await Store.subscription(task.subscription_id)
                     if task.pause_reason == "route" or route is None or not route.WS_BOT_ID:
@@ -1240,150 +1191,65 @@ class Service:
         self.wake_notices()
         return answer
 
-    async def record_success(self, task: ChestTask, record: ChestRecord) -> None:
-        record.state = "success"
-        if task.run_id == record.run_id:
-            task.successes += 1
-        await Store.save(record, task)
-        await self.failures.success("check:" + task.account_id)
-        await self.queue_results(record.account_id)
-
-    async def reconcile(self, task: ChestTask, info: UserInfo) -> bool:
-        unresolved = await Store.unresolved(task.account_id)
-        clear = True
-        now = time.time()
-        # 结果未确认、确认未生效后继续重试都是中间状态，只记日志；开成功发结果，重试耗尽才通知用户。
-        label = f"CUID {mask_cuid(task.account_id.split(':', 1)[-1])}"
-        for record in unresolved:
-            before = UserInfo.model_validate_json(record.before_info)
-            side: Side = "left" if record.side == "left" else "right"
-            if record.result or info.cooldown(side) > before.cooldown(side):
-                await self.record_success(task, record)
-            elif now - record.created_at >= SETTLE_SECONDS:
-                # 成功开箱一定会推进该侧冷却；早已超时仍未推进，说明请求没有生效（包括没发出去）。
-                record.state = "not_applied"
-                if task.status == "active":
-                    logger.warning(
-                        f"[WuwaTappoUID] {label}：{SIDE_NAMES[side]}宝箱上次请求没有生效（该侧冷却未变化），"
-                        "将按重试次数限制继续处理。"
-                    )
-                    await Store.save(record)
-                else:
-                    # 任务已不再运行，这次核对就是最终结论，告知用户。
-                    await Store.save(
-                        record,
-                        Notice(
-                            subscription_id=record.subscription_id,
-                            account_id=record.account_id,
-                            text=f"{SIDE_NAMES[side]}宝箱上次请求没有生效（该侧冷却未变化）。本次仅核对结果，不重新开箱。",
-                        ),
-                    )
-            else:
-                clear = False
-                if record.state != "uncertain":
-                    record.state = "uncertain"
-                    logger.warning(
-                        f"[WuwaTappoUID] {label}：{SIDE_NAMES[side]}宝箱结果尚未确认，"
-                        "暂缓开箱并继续查询，避免重复请求。"
-                    )
-                    await Store.save(record)
-        if unresolved:
-            # 中断后迟到的成功结果也立刻补发，不等下一次十件或到期。
-            await self.queue_results(task.account_id, force=True, reason="开箱请求核对结果")
-        return clear
-
     async def open_side(self, account: Account, task: ChestTask, side: Side, info: UserInfo) -> UserInfo:
-        recent = await Store.recent_chests(account.id, task.run_id, side)
-        failed = 0
-        for record in recent:
-            if record.state != "not_applied":
-                break
-            failed += 1
-        if failed == 4:
-            task.status = "paused"
-            task.pause_reason = "failure"
-            # 留下终止标记，用户恢复后才开始新的重试批次；不新增数据库列。
-            recent[0].state = "retry_exhausted"
-            message = (
-                f"{SIDE_NAMES[side]}宝箱首次请求及 3 次重试均未生效，已暂停；检查网络后可发送 {command_prefix()}恢复。"
-            )
-            await Store.save(
-                recent[0],
-                task,
-                Notice(subscription_id=task.subscription_id, account_id=account.id, text=message),
-            )
-            raise NetworkError(message)
-        if failed:
-            logger.warning(f"[WuwaTappoUID] {SIDE_NAMES[side]}宝箱已确认前次未生效，开始第 {failed}/3 次重试。")
         supplement = ""
-        # 最多一次自动补充、一次重试；每次真正发请求前都检查到期时间。
+        if info.remaining < CHEST_CLICK_COST:
+            info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task, info)
+            supplement = f"自动补充请求 {AUTO_CLICKS} 点击，服务端累计值实际变化 {delta:+d}。"
+            if problem:
+                supplement += f"提交提示：{problem}。"
+            if info.remaining < CHEST_CLICK_COST:
+                raise ClicksUnavailable(supplement + "本次未提交开箱。")
         for attempt in range(2):
             if self.closing:
                 return info
             self.check_deadline(task)
+            before_json = info.model_dump_json()
+            try:
+                result = await self.api.open(account.token, side, info.total_click_count)
+            except OperationStopped:
+                return info
+            except ApiError as error:
+                if error.code not in (70003, 70004, 70005, 70006, 10014):
+                    await self.queue_results(account.id, force=True, reason="开箱失败，汇总已开结果")
+                if error.code == 70005 and attempt == 0 and not supplement:
+                    info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task, info)
+                    supplement = f"自动补充请求 {AUTO_CLICKS} 点击，服务端累计值实际变化 {delta:+d}。"
+                    if problem:
+                        supplement += f"提交提示：{problem}。"
+                    if delta > 0 and info.remaining >= CHEST_CLICK_COST:
+                        continue
+                    raise ClicksUnavailable(supplement + "本次未重试开箱。") from None
+                if error.code == 70005:
+                    raise ClicksUnavailable(supplement + "再次开箱仍提示点击不足，本轮停止重试。") from None
+                if error.is_auth:
+                    await self.expire_account(account)
+                    raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
+                if supplement:
+                    await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}。\n{supplement}")
+                raise
+            except (NetworkError, DataError):
+                await self.queue_results(account.id, force=True, reason="开箱响应中断")
+                raise
+            info.total_click_consume += result.click_consume
+            info.set_cooldown(side, time.time() + CHEST_COOLDOWN)
+            account.info = info.model_dump_json()
+            account.verified_at = time.time()
             record = ChestRecord(
                 account_id=account.id,
                 run_id=task.run_id,
                 subscription_id=task.subscription_id,
                 side=side,
-                before_info=info.model_dump_json(),
+                state="success",
+                before_info=before_json,
+                result=result.model_dump_json(),
                 supplement=supplement,
             )
-            await Store.save(record)
-            if self.closing or time.time() >= task.expires_at:
-                record.state = "not_sent"
-                await Store.save(record)
-                if self.closing:
-                    return info
-                raise Expired
-            try:
-                result = await self.api.open(account.token, side, info.total_click_count)
-            except OperationStopped:
-                record.state = "not_sent"
-                await Store.save(record)
-                return info
-            except MaintenanceError as error:
-                record.state = "rejected"
-                record.result = str(error)
-                await Store.save(record)
-                raise
-            except ApiError as error:
-                record.state = "rejected"
-                record.result = str(error)
-                await Store.save(record)
-                # 无可用宝箱、仍在冷却、服务端忙只是稍后再查，点击不足另行处理，都不在这里汇总结果。
-                if error.code not in (70004, 70005, 70006, 10014):
-                    await self.queue_results(account.id, force=True, reason="开箱失败，汇总已开结果")
-                if error.code == 70005 and attempt == 0:
-                    info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task)
-                    supplement = f"自动补充请求 {AUTO_CLICKS} 点击，服务端累计值实际变化 {delta:+d}。"
-                    if problem:
-                        supplement += f"提交提示：{problem}。"
-                    record.supplement = supplement
-                    await Store.save(record)
-                    if delta > 0:
-                        continue
-                    raise ClicksUnavailable(supplement + "本次未重试开箱。")
-                if error.code == 70005:
-                    raise ClicksUnavailable(supplement + "再次开箱仍提示点击不足，本轮停止重试。")
-                if error.is_auth:
-                    # 先验证原会话，本次不再次提交开箱。
-                    await self.refresh(account, fresh=True)
-                    raise WuwaError("开箱请求被拒绝，但token仍可查询；本次停止开箱。") from None
-                if supplement:
-                    await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}。\n{supplement}")
-                raise
-            except (NetworkError, DataError):
-                # 冷却推进就结算成功；120 秒后确认未生效才重试，累计最多初次加 3 次。
-                await self.queue_results(account.id, force=True, reason="开箱响应中断")
-                fresh = await self.refresh(account, fresh=True)
-                await self.reconcile(task, fresh)
-                return fresh
-            record.result = result.model_dump_json()
-            await Store.save(record)
-            fresh = await self.refresh(account, fresh=True)
-            await self.record_success(task, record)
-            return fresh
+            task.successes += 1
+            await Store.save(account, record, task)
+            await self.failures.success("check:" + task.account_id)
+            await self.queue_results(account.id)
+            return info
         raise RuntimeError("开箱重试流程没有产生结果")
 
     @tracked_method
@@ -1451,10 +1317,6 @@ class Service:
                 if account is None:
                     raise DataError("任务关联的账号数据缺失。")
                 info = await self.refresh(account)
-                if not await self.reconcile(task, info):
-                    await self.failures.success("check:" + key)
-                    retry = True
-                    return
                 for side in ("left", "right"):
                     if self.closing:
                         break
@@ -1465,16 +1327,17 @@ class Service:
                         info = await self.open_side(account, task, side, info)
                     except ApiError as error:
                         if error.code == 70006:
-                            info = await self.refresh(account)
                             retry = True
                             continue
+                        if error.code == 70003:
+                            info = await self.refresh(account, fresh=True, force_remote=True)
+                            await self.task_failure(task, error)
+                            retry = True
+                            return
                         if error.code in (70004, 10014):
                             retry = True
                             break
                         raise
-                    if await Store.unresolved(key):
-                        retry = True
-                        break
                 await self.failures.success("check:" + key)
             except OperationStopped:
                 return
@@ -1515,17 +1378,11 @@ class Service:
                     if error.is_auth:
                         account = await Store.account(key)
                         if account is not None:
-                            try:
-                                await self.refresh(account, fresh=True)
-                            except AuthenticationError:
-                                task.status = "paused"
-                                task.pause_reason = "auth"
-                                await Store.save(task)
-                                self.unschedule(key)
-                            else:
-                                # 业务请求拒绝但账号仍可查询，不标记token过期。
-                                await self.task_failure(task, error)
-                                retry = True
+                            await self.expire_account(account)
+                        task.status = "paused"
+                        task.pause_reason = "auth"
+                        await Store.save(task)
+                        self.unschedule(key)
                     else:
                         await self.task_failure(task, error)
                         retry = True
@@ -1696,44 +1553,6 @@ class Service:
                     task.next_check = time.time()
                     self.schedule(task)
                     await self.failures.success("restore:" + key)
-            for key in await Store.unresolved_accounts():
-                if self.account_lock(key).locked() or not self.failures.allows("reconcile:" + key):
-                    continue
-                async with self.account_lock(key):
-                    task = await Store.task(key)
-                    if task is None or task.status in ("active", "paused"):
-                        continue
-                    account = await Store.account(key)
-                    if account is None or account.token_state == "expired":
-                        continue
-                    try:
-                        # 结束后只查询原登录态，不重新登录、不提交点击或开箱。
-                        info = await self.api.me(account.token, fresh=True)
-                        if str(info.cuid) != account.cuid:
-                            raise DataError("核对返回的 CUID 与账号不一致。")
-                        account.info = info.model_dump_json()
-                        account.verified_at = time.time()
-                        await Store.save(account)
-                        await self.reconcile(task, info)
-                        await self.failures.success("reconcile:" + key)
-                    except SQLAlchemyError:
-                        raise
-                    except MaintenanceError:
-                        continue
-                    except Exception as error:
-                        if isinstance(error, ApiError) and error.is_auth:
-                            await self.expire_account(account)
-                            await self.failures.success("reconcile:" + key)
-                            continue
-                        if isinstance(error, ApiError) and error.code == 10014:
-                            continue
-                        await self.failures.fail(
-                            "reconcile:" + key,
-                            "已结束任务的结果核对",
-                            self.error_detail(error),
-                            key,
-                            limit=1 if isinstance(error, DataError) else None,
-                        )
             for key in await Store.result_accounts():
                 if self.account_lock(key).locked() or not self.failures.allows("results:" + key):
                     continue

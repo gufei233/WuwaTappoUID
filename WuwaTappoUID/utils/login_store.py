@@ -112,7 +112,7 @@ class LoginStore:
         account = await session.get(Account, row.account_id)
         if account is None or digest(account.token) != token_digest or row.token_digest != token_digest:
             return False
-        account.info = info.model_dump_json()
+        account.info = info.merge_saved(account.info).model_dump_json()
         account.verified_at = time.time()
         account.token_state = "ready"
         account.token_expires_at = expires_at

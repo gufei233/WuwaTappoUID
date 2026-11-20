@@ -561,7 +561,7 @@ class LoginManager:
                 checkpoint.phase = "outcome"
                 await self.service.failures.success("renew:" + account.id)
                 try:
-                    note = await self.service.resume_after_token(account, checkpoint.info)
+                    note = await self.service.resume_after_token(account, checkpoint.info.merge_saved(account.info))
                 except (DatabaseWriteTimeout, WriteGateTimeout, SQLAlchemyError, WuwaError) as error:
                     note = (
                         "登录成功，但任务尚未恢复："

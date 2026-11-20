@@ -45,7 +45,7 @@ async def _synthesize(
     problem = ""
     bag_current = True
     run_id = new_id()
-    async with service.heavy_operation(event, "合成", on_started, request_scope=request_scope) as (_, account):
+    async with service.heavy_operation(event, "合成", on_started, request_scope=request_scope) as (binding, account):
         await service.refresh(account)
         items = await service.read_bag(account)
         owned_before = {str(item.asset_id) for item in items if item.quantity > 0}
@@ -88,12 +88,8 @@ async def _synthesize(
                 await Store.save(record)
                 if error.is_auth:
                     logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：合成鉴权被拒绝，{error.details}。")
-                if error.is_auth:
-                    try:
-                        await service.refresh(account, fresh=True)
-                        problem = "合成请求被拒绝，但账号查询确认token可用；本轮已停止。"
-                    except WuwaError as confirmation:
-                        problem = str(confirmation)
+                    await service.expire_account(account)
+                    problem = service.expired_message(account, binding.id)
                     break
                 problem = f"服务端拒绝本次合成：{error}，本轮已停止。"
                 break
