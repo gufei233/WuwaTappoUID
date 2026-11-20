@@ -417,8 +417,10 @@ class WuwaAPI:
     async def renew_token(self, token: str) -> None:
         # 续期延长服务端期限，超时不盲目重复；仍保留原 token。
         result = await self.request("/api/frontend/user/renew-token", "GET", token=token, retry=False)
-        if result is not True:
-            raise DataError("token 续期接口未返回 true，原会话已保留。")
+        # 2026-11-20 起官方返回 {"expire_at_ms": …}，布尔 true 是旧形态，两者都算续期成功。
+        if result is True or (isinstance(result, dict) and result.get("expire_at_ms")):
+            return
+        raise DataError("token 续期接口未返回 true，原会话已保留。")
 
     async def me(self, token: str, *, fresh: bool = False) -> UserInfo:
         async with self.token_use(token):
