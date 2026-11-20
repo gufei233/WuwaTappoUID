@@ -112,14 +112,14 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
                 raise WuwaError(command_hint("请撤回群内 token，并在私聊中使用 wt添加token。"))
             match = re.fullmatch(r"(\S+)(?:\s+(国服|海外))?", argument)
             if match is None:
-                raise WuwaError(command_hint("用法：wt添加token TOKEN，可在末尾加国服或海外；token 前的空格可省。"))
+                raise WuwaError(command_hint("用法：wt添加token TOKEN [国服/海外]（仅限私聊）"))
             domestic = None if match[2] is None else 0 if match[2] == "海外" else 1
             replies = await service.bind_token(event, match[1], domestic)
         elif command == "切换":
             if argument:
                 match = re.fullmatch(r"([0-9]+|\[[0-9]+\])(?:\s+(国服|海外))?", argument)
                 if match is None:
-                    raise WuwaError(command_hint("用法：wt切换 [编号] 或 wt切换 CUID；不带参数则切换到下一个账号。"))
+                    raise WuwaError(command_hint("用法：wt切换 [编号/CUID]（不带参数切到下一个）"))
                 domestic = None if match[2] is None else 0 if match[2] == "海外" else 1
                 replies = [await service.switch(event, match[1], domestic)]
             else:
@@ -128,7 +128,7 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
             if argument:
                 match = re.fullmatch(r"([0-9]+|\[[0-9]+\])(?:\s+(国服|海外))?", argument)
                 if match is None:
-                    raise WuwaError(command_hint("用法：wt删除 [编号] 或 wt删除 CUID；不带参数删除当前绑定。"))
+                    raise WuwaError(command_hint("用法：wt删除 [编号/CUID]（不带参数删除当前账号）"))
                 domestic = None if match[2] is None else 0 if match[2] == "海外" else 1
                 replies = [await service.delete_account(event, match[1], domestic)]
             else:
@@ -138,7 +138,7 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
                 raise WuwaError(command_hint("请输入正整数，例如 wt增加次数1000 或 wt增加次数 1000。"))
 
             async def increase_started() -> None:
-                await bot.send("开始增加次数，将先核对账号和累计值，请等待结果。")
+                await bot.send("正在增加点击次数，请稍候。")
 
             replies = await service.increase(event, int(argument), increase_started, request_scope=request_scope)
         elif command == "合成":
@@ -150,7 +150,7 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
             replies = await service.synthesize(event, options, synthesis_started, request_scope=request_scope)
         elif command == "兑换":
             if not argument or len(argument.split()) != 1:
-                raise WuwaError(command_hint("用法：wt兑换 CODE，为当前账号使用一个兑换码。"))
+                raise WuwaError(command_hint("用法：wt兑换 兑换码"))
             replies = await service.redeem(event, argument)
         elif command == "开箱统计":
             replies = await service.chest_statistics(event, StatisticsPeriod.parse(argument))
@@ -203,7 +203,7 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
         await service.disable_database(error)
         replies = [service.database_error]
     except (DatabaseWriteTimeout, WriteGateTimeout):
-        replies = [command_hint("数据库未能完成本次操作。请稍后用 wt次数 或 wt宝箱 确认实际状态后再操作。")]
+        replies = [command_hint("服务繁忙，请稍后发送 wt信息 确认当前状态。")]
     except Exception as error:
         logger.exception("[WuwaTappoUID] 命令出现意外错误")
         replies = [f"命令异常（{type(error).__name__}），已记录；请检查实际状态后再操作。"]
@@ -214,6 +214,6 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
     if event.user_type == "group" and command not in ("背包", "图鉴", "查看"):
         messages = [MessageSegment.at(event.user_id), MessageSegment.text("\n"), *messages]
     if command in ("信息", "次数", "宝箱") and any(isinstance(reply, bytes) for reply in replies):
-        await bot.send_option(messages, query_buttons(), unsuported_platform=True)
+        await bot.send_option(messages, query_buttons())
     else:
         await bot.send(messages)

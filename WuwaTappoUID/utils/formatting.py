@@ -23,7 +23,7 @@ def mask_cuid(cuid: str | int) -> str:
 def date_text(timestamp: float) -> str:
     if timestamp <= 0:
         return "已可开启"
-    return datetime.fromtimestamp(timestamp, CHINA).strftime("%m-%d %H:%M:%S（北京时间）")
+    return datetime.fromtimestamp(timestamp, CHINA).strftime("%m-%d %H:%M")
 
 
 def remaining_text(seconds: float) -> str:

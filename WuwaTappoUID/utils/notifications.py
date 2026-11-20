@@ -92,7 +92,7 @@ async def notice_messages(
             service.cache_notice_image(notice.id, revision, name, prefix, rendered)
         return [MessageSegment.image(page) for page in rendered]
     label = f"CUID {mask_cuid(account.cuid)}：\n" if account is not None else ""
-    messages = [MessageSegment.text(label + notice_text + "\n")]
+    messages = [MessageSegment.text(label + notice_text)]
     if notice.asset_id:
         try:
             async with asyncio.timeout(20):
@@ -317,10 +317,11 @@ async def _send_notice_group(
                 return False
     fallback = not contents or service.failures.blocked(render_key)
     if fallback:
-        contents = [MessageSegment.text("结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n")]
+        lines = ["结果图片暂不可用，以下为本次文字通知："]
         for notice in notices:
             text = notice.text.replace(account.cuid, mask_cuid(account.cuid)) if account else notice.text
-            contents.append(MessageSegment.text(text + "\n"))
+            lines.append(text)
+        contents = [MessageSegment.text("\n".join(lines))]
     messages = [MessageSegment.node(contents)] if sum(m.type == "image" for m in contents) > 1 else contents
     if event.user_type == "group":
         messages = [MessageSegment.at(event.user_id), MessageSegment.text("\n"), *messages]

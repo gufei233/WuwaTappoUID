@@ -41,7 +41,7 @@ async def _synthesize(
     request_scope: AsyncExitStack,
 ) -> list[str | bytes]:
     results: list[SynthesisResult] = []
-    upgrades = same_count = spent = 0
+    spent = 0
     problem = ""
     bag_current = True
     run_id = new_id()
@@ -103,8 +103,6 @@ async def _synthesize(
             record.state = "success"
             await Store.save(record)
             results.append(result)
-            same_count += int(recipe.same_level)
-            upgrades += int(not recipe.same_level)
             spent += len(recipe.asset_ids)
             try:
                 items = await service.read_bag(account, fresh=True)
@@ -118,25 +116,27 @@ async def _synthesize(
                 problem = command_hint("服务端背包数量尚未与合成消耗一致，本轮已停止；请用 wt背包 核对。")
                 break
     service.wake_notices()
-    summary = f"本轮范围：{options.scope}。已确认：升阶 {upgrades} 次，同阶 {same_count} 次。"
-    summary += f"消耗多余物品 {spent} 件，获得 {len(results)} 件。"
     if not results and not problem:
         cost = 5 if options.same_level else 10
         return [
             f"{options.scope}没有足够的多余物品可{options.mode_name}合成："
             f"已跳过收藏，每种保留 1 件，需同品类同稀有度 {cost} 件。"
         ]
+    if not results:
+        return [f"合成已停止（{options.scope}）：\n{problem}"]
+    summary = (
+        f"合成完成（{options.scope} · {options.mode_name} {len(results)} 次）："
+        f"消耗 {spent} 件，获得 {len(results)} 件。"
+    )
     if problem:
         summary += "\n" + problem
-    if not results:
-        return [summary]
     try:
         images = await service.cards.synthesis(
             account,
             results,
             items if bag_current else None,
             event,
-            f"{options.scope} · 升阶 {upgrades} 次 · 同阶 {same_count} 次",
+            f"{options.scope} · {options.mode_name} {len(results)} 次",
             owned_before,
         )
     except Exception:

@@ -120,7 +120,7 @@ class Service:
     @asynccontextmanager
     async def subscription(self, event: Event, name: str, uid: str) -> AsyncIterator[int]:
         if not event.WS_BOT_ID:
-            raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存自动推送目标。")
+            raise WuwaError("当前会话不支持自动推送，请在群聊或私聊中使用。")
         async with self.subscription_lock:
             await gs_subscribe.add_subscribe("single", name, event, uid=uid)
             subscriptions = await gs_subscribe.get_subscribe(name, uid=uid)
@@ -265,9 +265,8 @@ class Service:
     def expired_message(account: Account, owner_id: str) -> str:
         if account.can_recover(owner_id):
             return (
-                f"登录态已失效，可发送 {command_prefix()}恢复 使用已保存的SDK凭据重新登录。\n"
-                f"SDK恢复凭据有效至：{date_text(account.sdk_expires_at)}\n"
-                "恢复登录会使官方客户端当前的登录态失效。"
+                f"登录态已失效，发送 {command_prefix()}恢复 可免验证码重登（将顶掉电脑端）。\n"
+                f"恢复凭据有效至：{date_text(account.sdk_expires_at)}"
             )
         return command_hint(TOKEN_EXPIRED_MESSAGE)
 
@@ -295,9 +294,9 @@ class Service:
                     Notice(
                         subscription_id=task.subscription_id,
                         account_id=account.id,
-                        text=f"{date_text(time.time())}：{self.expired_message(account, task.owner_id)}"
+                        text=self.expired_message(account, task.owner_id)
                         + (
-                            "\n自动开箱已暂停，原到期时间保留。"
+                            "\n自动开箱已暂停，剩余时长保留。"
                             if task.pause_reason == "auth"
                             else "\n任务维持原暂停状态。"
                         ),
@@ -320,7 +319,7 @@ class Service:
                 Notice(
                     subscription_id=subscription_id,
                     account_id=account.id,
-                    text=f"{date_text(time.time())}：{message}\n未发送的开箱结果将在登录恢复后补发。",
+                    text=f"{message}\n未发送的开箱结果将在登录恢复后补发。",
                 )
                 for subscription_id in waiting
             ]
@@ -437,14 +436,14 @@ class Service:
         """调用方持有账号锁；只恢复因鉴权失效暂停的有效任务。"""
         task = await Store.task(account.id)
         if task is None or task.status not in ("active", "paused"):
-            return "当前没有待恢复的宝箱任务。"
+            return command_hint("发送 wt宝箱 可开启自动开箱。")
         if task.status == "active":
             return "宝箱任务继续运行。"
         if task.pause_reason != "auth":
             return command_hint("宝箱任务保持暂停，可用 wt恢复 操作。")
         if task.remaining() <= 0:
-            await self.finish(task, "expired", "本轮已到期")
-            return command_hint("宝箱任务已到期，请用 wt宝箱 开启新任务。")
+            await self.finish(task, "expired", "本轮已到期", notify=False)
+            return command_hint("原宝箱任务已到期，发送 wt宝箱 可开启新一轮。")
         if task.paused_at is not None:
             task.expires_at += time.time() - task.paused_at
         task.paused_at = None
@@ -452,14 +451,7 @@ class Service:
         task.pause_reason = ""
         task.next_check = self.next_wakeup(task, info)
         await self.failures.reset_account(account.id)
-        await Store.save(
-            task,
-            Notice(
-                subscription_id=task.subscription_id,
-                account_id=account.id,
-                text="token已更新，宝箱任务已自动恢复，继续剩余有效期。",
-            ),
-        )
+        await Store.save(task)
         self.schedule(task)
         return "宝箱任务已自动恢复，继续剩余有效期。"
 
@@ -552,10 +544,15 @@ class Service:
             accounts = await Store.linked_accounts(owner)
             if not accounts:
                 raise WuwaError(command_hint("请先发送 wt登录 或 wt添加token TOKEN。"))
-            lines = ["已绑定的 CUID："]
+            binding = await Store.binding(owner)
+            current_id = binding.account_id if binding is not None else ""
+            lines = ["已绑定的账号："]
             for index, account in enumerate(accounts, 1):
+                current = " · 当前" if account.id == current_id else ""
                 status = " · token已过期" if account.token_state == "expired" else ""
-                lines.append(f"[{index}] {mask_cuid(account.cuid)}（{'国服' if account.domestic else '海外'}）{status}")
+                lines.append(
+                    f"[{index}] {mask_cuid(account.cuid)}（{'国服' if account.domestic else '海外'}）{current}{status}"
+                )
         return "\n".join(lines) + command_hint("\nwt切换 [x] 切换账号；wt删除 [x] 删除绑定。")
 
     async def delete_account(self, event: Event, cuid: str = "", domestic: int | None = None) -> str:
@@ -573,7 +570,7 @@ class Service:
                 task = await Store.task(target.id)
                 stopped = task is not None and task.owner_id == owner and task.status in ("active", "paused")
                 if stopped:
-                    await self.finish(task, "stopped", "已删除绑定，自动开箱已停止")
+                    await self.finish(task, "stopped", "已删除绑定，自动开箱已停止", notify=False)
                 remaining = [a for a in accounts if a.id != target.id]
                 replacement = remaining[0].id if remaining else None
                 finalized_notices = await Store.delete_link(owner, target.id, replacement)
@@ -647,7 +644,7 @@ class Service:
         return (
             f"已切换到 CUID {mask_cuid(target.cuid)}（{'国服' if target.domestic else '海外'}）。"
             "原账号的任务、订阅及推送位置不变。"
-            + ("\n" + command_hint(TOKEN_EXPIRED_MESSAGE) if target.token_state == "expired" else "")
+            + ("\n" + self.expired_message(target, owner) if target.token_state == "expired" else "")
         )
 
     async def subscribe(self, event: Event, enabled: bool) -> str:
@@ -665,9 +662,9 @@ class Service:
                     await self.queue_results(account.id)
         self.wake_notices()
         return f"CUID {mask_cuid(account.cuid)}：" + (
-            "已开启10次后通知；失败、重新登录、暂停或任务结束时也会补发已有结果。"
+            "已开启每满10次推送；中断或任务结束时也会补发已有结果。"
             if enabled
-            else "已关闭10次后通知，任务结束后汇总发图；中途失败、重新登录或暂停时仍发送已开出的结果。"
+            else "已关闭每满10次推送，改为任务结束汇总；中断时仍补发已有结果。"
         )
 
     async def queue_results(self, key: str, *, force: bool = False, reason: str = "") -> None:
@@ -891,7 +888,7 @@ class Service:
                 _, delta, problem = await self.add_clicks(account, number)
             self.wake_notices()
             image = await self.cards.click_summary(account, event, number, delta)
-            hint = f"提交提示：{problem}（已回读实际累计值）" if problem else ""
+            hint = f"提示：{problem}（已同步最新累计值）" if problem else ""
             return [hint, image] if hint else [image]
 
     def job_id(self, key: str) -> str:
@@ -965,7 +962,7 @@ class Service:
                 ):
                     raise WuwaError("这个账号已有其他用户开启的任务，请由任务所属用户操作。")
                 if task is not None and task.status in ("active", "paused") and task.remaining(now) <= 0:
-                    await self.finish(task, "expired", "本轮已到期")
+                    await self.finish(task, "expired", "本轮已到期", notify=False)
                 if task is not None and task.status in ("active", "paused"):
                     if task.owner_id != binding.id:
                         raise WuwaError("这个账号已有其他用户开启的任务，请由任务所属用户操作。")
@@ -982,7 +979,7 @@ class Service:
                 else:
                     await self.refresh(account)
                     if not event.WS_BOT_ID:
-                        raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存自动推送目标。")
+                        raise WuwaError("当前会话不支持自动推送，请在群聊或私聊中使用。")
                     run_id = new_id()
                     async with self.subscription(event, "WuwaTappo宝箱", run_id) as subscription_id:
                         now = time.time()
@@ -1003,19 +1000,22 @@ class Service:
         image = await self.cards.task_summary(account, task, event)
         return [answer, image]
 
-    async def finish(self, task: ChestTask, status: str, reason: str) -> None:
+    async def finish(self, task: ChestTask, status: str, reason: str, *, notify: bool = True) -> None:
         # 先持久化结束状态并撤销调度，结果汇总失败不能阻止任务停止。
         task.status = status
         task.paused_at = None
         await Store.save(task)
         self.unschedule(task.account_id)
         await self.queue_results(task.account_id, force=True, reason=reason)
+        if not notify:
+            return
+        suffix = command_hint("发送 wt宝箱 可开启新一轮。") if status == "expired" else ""
         await Store.save(
             task,
             Notice(
                 subscription_id=task.subscription_id,
                 account_id=task.account_id,
-                text=f"{reason}。本轮成功开箱 {task.successes} 个。",
+                text=f"{reason}，本轮共开启 {task.successes} 个宝箱。{suffix}",
             ),
         )
 
@@ -1025,8 +1025,8 @@ class Service:
             return "当前没有运行中的自动开箱任务，账号绑定已保留。"
         if task.owner_id != binding.id:
             raise WuwaError("任务属于绑定此账号的另一用户，请由任务所属用户停止。")
-        await self.finish(task, "stopped", reason)
-        return f"自动开箱已停止，账号绑定已保留。本轮成功 {task.successes} 个。"
+        await self.finish(task, "stopped", reason, notify=False)
+        return f"自动开箱已停止，账号绑定已保留。本轮共开启 {task.successes} 个宝箱。"
 
     async def stop(self, event: Event) -> str:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
@@ -1049,8 +1049,8 @@ class Service:
                 if task.owner_id != binding.id:
                     raise WuwaError("任务属于另一用户，请由任务所属用户操作。")
                 if task.remaining() <= 0:
-                    await self.finish(task, "expired", "本轮已到期")
-                    answer = command_hint("本轮已到期，请用 wt宝箱 开启新任务。")
+                    await self.finish(task, "expired", "本轮已到期", notify=False)
+                    answer = command_hint("本轮已到期，发送 wt宝箱 可开启新一轮。")
                 elif task.timer_paused:
                     answer = "任务和计时已经暂停。\n" + task_text(task)
                 else:
@@ -1059,14 +1059,7 @@ class Service:
                     task.paused_at = time.time()
                     action = "宝箱任务和计时已暂停，剩余有效期保留。"
                     task.next_check = time.time()
-                    await Store.save(
-                        task,
-                        Notice(
-                            subscription_id=task.subscription_id,
-                            account_id=account.id,
-                            text=action + "\n" + task_text(task),
-                        ),
-                    )
+                    await Store.save(task)
                     self.unschedule(account.id)
                     await self.queue_results(account.id, force=True, reason="任务暂停")
                     answer = action + "\n" + task_text(task)
@@ -1185,8 +1178,8 @@ class Service:
                 if task is None or task.status not in ("active", "paused"):
                     answer = prefix + "当前没有待恢复的宝箱任务。"
                 elif task.remaining() <= 0:
-                    await self.finish(task, "expired", "本轮已到期")
-                    answer = prefix + command_hint("原任务已到期，可发送 wt宝箱 开启新任务。")
+                    await self.finish(task, "expired", "本轮已到期", notify=False)
+                    answer = prefix + command_hint("原任务已到期，发送 wt宝箱 可开启新一轮。")
                 elif task.status == "active" and not (
                     self.failures.blocked("check:" + account.id) or self.failures.blocked("save:" + account.id)
                 ):
@@ -1203,14 +1196,7 @@ class Service:
                     task.status = "active"
                     task.pause_reason = ""
                     task.next_check = self.next_wakeup(task, info)
-                    await Store.save(
-                        task,
-                        Notice(
-                            subscription_id=task.subscription_id,
-                            account_id=account.id,
-                            text="登录态已确认，宝箱任务已恢复，继续原轮次。",
-                        ),
-                    )
+                    await Store.save(task)
                     await self.failures.reset_account(account.id)
                     self.schedule(task)
                     answer = prefix + "宝箱任务已恢复，继续原轮次。\n" + task_text(task)
@@ -1221,11 +1207,9 @@ class Service:
         supplement = ""
         if info.remaining < CHEST_CLICK_COST:
             info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task, info)
-            supplement = f"自动补充请求 {AUTO_CLICKS} 点击，服务端累计值实际变化 {delta:+d}。"
-            if problem:
-                supplement += f"提交提示：{problem}。"
+            supplement = f"自动补充 {AUTO_CLICKS} 点击后实际变化 {delta:+d}" + (f"，{problem}" if problem else "")
             if info.remaining < CHEST_CLICK_COST:
-                raise ClicksUnavailable(supplement + "本次未提交开箱。")
+                raise ClicksUnavailable(supplement)
         for attempt in range(2):
             if self.closing:
                 return info
@@ -1240,19 +1224,19 @@ class Service:
                     await self.queue_results(account.id, force=True, reason="开箱失败，汇总已开结果")
                 if error.code == 70005 and attempt == 0 and not supplement:
                     info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task, info)
-                    supplement = f"自动补充请求 {AUTO_CLICKS} 点击，服务端累计值实际变化 {delta:+d}。"
-                    if problem:
-                        supplement += f"提交提示：{problem}。"
+                    supplement = f"自动补充 {AUTO_CLICKS} 点击后实际变化 {delta:+d}" + (
+                        f"，{problem}" if problem else ""
+                    )
                     if delta > 0 and info.remaining >= CHEST_CLICK_COST:
                         continue
-                    raise ClicksUnavailable(supplement + "本次未重试开箱。") from None
+                    raise ClicksUnavailable(supplement) from None
                 if error.code == 70005:
-                    raise ClicksUnavailable(supplement + "再次开箱仍提示点击不足，本轮停止重试。") from None
+                    raise ClicksUnavailable(f"{supplement}，再次开箱仍提示点击不足") from None
                 if error.is_auth:
                     await self.expire_account(account)
                     raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
                 if supplement:
-                    await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}。\n{supplement}")
+                    await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}（{supplement}）。")
                 raise
             except (NetworkError, DataError):
                 await self.queue_results(account.id, force=True, reason="开箱响应中断")
@@ -1315,7 +1299,7 @@ class Service:
             interrupted = False
             try:
                 if task.remaining() <= 0:
-                    await self.finish(task, "expired", "本轮自动开箱已结束")
+                    await self.finish(task, "expired", "自动开箱已到期")
                     return
                 if await self.pause_invalid_route(task):
                     return
@@ -1329,8 +1313,8 @@ class Service:
                             subscription_id=task.subscription_id,
                             account_id=key,
                             text=(
-                                f"自动开箱剩余不超过 1 小时，可发送 {command_prefix()}宝箱"
-                                f" 在原到期时间上续期 {chest_task_hours()} 小时。\n到期：{date_text(task.expires_at)}"
+                                f"自动开箱剩余不足 1 小时（{date_text(task.expires_at)} 到期），"
+                                f"发送 {command_prefix()}宝箱 可顺延 {chest_task_hours()} 小时。"
                             ),
                         ),
                     )
@@ -1368,7 +1352,7 @@ class Service:
             except OperationStopped:
                 return
             except Expired:
-                await self.finish(task, "expired", "本轮自动开箱已结束")
+                await self.finish(task, "expired", "自动开箱已到期")
             except MaintenanceError:
                 retry = True
             except ClicksUnavailable as error:
@@ -1382,7 +1366,10 @@ class Service:
                     Notice(
                         subscription_id=task.subscription_id,
                         account_id=key,
-                        text=f"点击不足，自动开箱已暂停。{error}\n请先补足点击，再发送 {command_prefix()}恢复。",
+                        text=(
+                            f"剩余点击不足，自动开箱已暂停（{error}）。\n"
+                            f"请发送 {command_prefix()}增加次数 补足后，再发送 {command_prefix()}恢复。"
+                        ),
                     ),
                 )
             except NetworkError as error:

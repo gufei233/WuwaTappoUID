@@ -203,7 +203,7 @@ class LoginManager:
     async def create(self, event: Event) -> list[str | bytes]:
         self.service.require_database()
         if not event.WS_BOT_ID:
-            raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存登录通知目标。")
+            raise WuwaError("当前会话不支持自动推送，请在群聊或私聊中使用。")
         use_local = settings.get_config("login_use_local").data
         base = normalize_login_base(settings.get_config("login_public_url").data)
         if not base and use_local:
@@ -571,9 +571,9 @@ class LoginManager:
                 if checkpoint.expiry_error:
                     note += "\n登录态有效期格式异常，已保留新 token：" + checkpoint.expiry_error
                 note += (
-                    command_hint("\n已保存本人的SDK恢复凭据，可在有效期内发送 wt恢复 重新登录。")
+                    command_hint("\n已保存免验证码恢复凭据，掉线时发送 wt恢复 即可。")
                     if account.can_recover(row.owner_id)
-                    else "\n本次登录未启用免验证码恢复；使用外置登录时请更新ww-login。"
+                    else "\n本次未启用免验证码恢复。"
                 )
                 checkpoint.message = "登录成功，已绑定为当前账号。"
                 checkpoint.result = json.dumps(

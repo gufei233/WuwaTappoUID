@@ -203,7 +203,7 @@ def render_account(
     state = task.state(now) if task is not None else "未开启"
     label = task.label(now) if task is not None else state
     pill(canvas, draw, 158, top + 10, label, state == "运行中")
-    text(draw, 838, top + 15, "10次后通知" if subscribed else "任务结束汇总", 14, SOFT, align="right")
+    text(draw, 838, top + 15, "每满10次推送" if subscribed else "任务结束汇总", 14, SOFT, align="right")
     if task is not None and state in ("运行中", "已暂停"):
         text(draw, 61, top + 52, f"剩余 {duration(task.remaining(now))} · 本轮成功 {task.successes}个", 16, limit=494)
         deadline = "恢复后计算到期时间" if task.paused_at is not None else stamp(task.expires_at) + " 到期"
@@ -242,7 +242,7 @@ def render_task(profile: Header, task: TaskSnapshot) -> bytes:
     canvas, draw = base(profile, "宝箱任务", 600)
     panel(canvas, 36, 222, 828, 170)
     pill(canvas, draw, 62, 241, task.label(now), state == "运行中")
-    text(draw, 836, 245, "10次后通知" if task.subscribed else "任务结束汇总", 15, SOFT, align="right")
+    text(draw, 836, 245, "每满10次推送" if task.subscribed else "任务结束汇总", 15, SOFT, align="right")
     text(draw, 63, 284, "剩余有效期" + (" · 已冻结" if paused else ""), 15, SOFT)
     text(draw, 60, 312, duration(task.remaining(now)), 40, line=57, limit=456)
     rule(draw, 556, 291, 556, 366)
