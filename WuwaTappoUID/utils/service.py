@@ -43,6 +43,7 @@ from .schema import (
     SIDE_NAMES,
     TOKEN_EXPIRED_MESSAGE,
     TOKEN_LIFETIME,
+    TOKEN_RENEW_BLOCKED_RETRY,
     TOKEN_RENEW_RETRY,
     TOKEN_RENEW_WINDOW,
     ApiError,
@@ -391,7 +392,7 @@ class Service:
     async def renew_token_if_needed(self, account: Account) -> None:
         now = time.time()
         failure_key = "renew:" + account.id
-        if not self.failures.allows(failure_key):
+        if not self.failures.cooldown_ready(failure_key):
             return
         if account.token_renew_after > now:
             return
@@ -399,24 +400,38 @@ class Service:
             return
         try:
             expires_at = await self.api.renew_token(account.token)
+            if expires_at is not None and expires_at <= now:
+                raise DataError("token 续期返回的有效期未推进，原会话已保留。")
         except MaintenanceError:
             raise
         except WuwaError as error:
-            account.token_renew_after = now + TOKEN_RENEW_RETRY
-            await Store.save(account)
             if isinstance(error, ApiError) and error.is_auth:
                 await self.expire_account(account)
+                await self.failures.reset(failure_key)
                 raise AuthenticationError(command_hint(TOKEN_EXPIRED_MESSAGE)) from None
             if isinstance(error, ApiError) and error.code == 10014:
                 return
             reason = self.error_detail(error)
-            await self.failures.fail(failure_key, "后台token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
+            await self.failures.fail(
+                failure_key,
+                "后台token续期",
+                reason,
+                account.id,
+                delay=TOKEN_RENEW_RETRY,
+                blocked_delay=TOKEN_RENEW_BLOCKED_RETRY,
+            )
             return
         account.token_expires_at = expires_at if expires_at is not None else now + TOKEN_LIFETIME
-        account.token_renew_after = 0
+        remaining = account.token_expires_at - now
+        account.token_renew_after = (
+            now + min(TOKEN_RENEW_BLOCKED_RETRY, max(60.0, remaining / 2)) if remaining < TOKEN_RENEW_WINDOW else 0
+        )
         await Store.save(account)
         await self.failures.success(failure_key)
-        logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：原 token 续期成功，未重新登录。")
+        logger.info(
+            f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}："
+            f"原 token 续期成功，有效期至 {date_text(account.token_expires_at)}，未重新登录。"
+        )
 
     async def resume_after_token(self, account: Account, info: UserInfo) -> str:
         """调用方持有账号锁；只恢复因鉴权失效暂停的有效任务。"""
@@ -471,10 +486,21 @@ class Service:
                 if account.sdk_owner_id == owner:
                     account.clear_sdk()
                 # refresh 会优先使用数据库里的旧 token；新会话验证后直接保存。
+                token_expires_at = 0.0
+                try:
+                    renewed = await self.api.renew_token(token)
+                except WuwaError:
+                    pass
+                else:
+                    now = time.time()
+                    if renewed is None:
+                        token_expires_at = now + TOKEN_LIFETIME
+                    elif renewed > now:
+                        token_expires_at = renewed
                 previous_token = account.token
                 account.token = token
                 account.token_state = "ready"
-                account.token_expires_at = 0
+                account.token_expires_at = token_expires_at
                 account.token_renew_after = 0
                 info = info.merge_saved(account.info)
                 account.info = info.model_dump_json()
@@ -1516,7 +1542,7 @@ class Service:
     @tracked_method
     @with_read_cache
     async def maintain(self) -> None:
-        """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
+        """每分钟执行：补排丢失了下次检查的任务、保活临期 token，再补发待提交的通知。"""
         if self.closing or not self.database_ready:
             return
         # 冷却期内不重试；达到告警阈值后冷却结束仍继续尝试，成功即恢复，不必等重启。
@@ -1566,6 +1592,22 @@ class Service:
                         continue
                     except Exception as error:
                         await self.failures.fail("results:" + key, "开箱结果汇总", self.error_detail(error), key)
+            now = time.time()
+            for key in await Store.renewable_accounts(now + TOKEN_RENEW_WINDOW, now):
+                if self.closing:
+                    break
+                if self.account_lock(key).locked() or not self.failures.cooldown_ready("renew:" + key):
+                    continue
+                async with self.account_lock(key):
+                    account = await Store.account(key)
+                    if account is None or account.token_state != "ready" or not account.token:
+                        continue
+                    try:
+                        await self.renew_token_if_needed(account)
+                    except AuthenticationError:
+                        continue
+                    except MaintenanceError:
+                        break
         self.wake_notices()
 
     def release_notice_image(self, key: str) -> None:

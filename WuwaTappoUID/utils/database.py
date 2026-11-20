@@ -732,6 +732,19 @@ class Store:
 
     @classmethod
     @with_read_session
+    async def renewable_accounts(cls, session: AsyncSession, deadline: float, now: float) -> list[str]:
+        result = await session.execute(
+            select(col(Account.id)).where(
+                Account.token_state == "ready",
+                Account.token != "",
+                or_(Account.token_expires_at == 0, Account.token_expires_at <= deadline),
+                Account.token_renew_after <= now,
+            )
+        )
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
     async def notice_accounts(
         cls, session: AsyncSession, until: float, limit: int = 100, after: tuple[float, str] | None = None
     ) -> list[tuple[str, float]]:
