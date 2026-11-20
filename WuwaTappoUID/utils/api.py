@@ -39,6 +39,7 @@ from .schema import (
     Side,
     SynthesisResult,
     UserInfo,
+    token_expiry,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -414,13 +415,19 @@ class WuwaAPI:
         data = await self.request("/api/auth/player/query", payload=payload)
         return parse(RoleQuery, data)
 
-    async def renew_token(self, token: str) -> None:
+    async def renew_token(self, token: str) -> float | None:
         # 续期延长服务端期限，超时不盲目重复；仍保留原 token。
         result = await self.request("/api/frontend/user/renew-token", "GET", token=token, retry=False)
-        # 2026-11-20 起官方返回 {"expire_at_ms": …}，布尔 true 是旧形态，两者都算续期成功。
-        if result is True or (isinstance(result, dict) and result.get("expire_at_ms")):
-            return
-        raise DataError("token 续期接口未返回 true，原会话已保留。")
+        if result is True:
+            return None
+        # 2026-11-20 起官方返回 {"expire_at_ms": ...}，按服务端真实毫秒时间戳更新过期时间；布尔 true 仍兼容。
+        if isinstance(result, dict) and "expire_at_ms" in result:
+            raw = result["expire_at_ms"]
+            if isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
+                expires_at = token_expiry(raw)
+                if expires_at > 0:
+                    return expires_at
+        raise DataError("token 续期接口返回格式异常，原会话已保留。")
 
     async def me(self, token: str, *, fresh: bool = False) -> UserInfo:
         async with self.token_use(token):

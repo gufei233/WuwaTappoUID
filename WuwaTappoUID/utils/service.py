@@ -398,7 +398,7 @@ class Service:
         if account.token_expires_at and account.token_expires_at - now >= TOKEN_RENEW_WINDOW:
             return
         try:
-            await self.api.renew_token(account.token)
+            expires_at = await self.api.renew_token(account.token)
         except MaintenanceError:
             raise
         except WuwaError as error:
@@ -412,7 +412,7 @@ class Service:
             reason = self.error_detail(error)
             await self.failures.fail(failure_key, "后台token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
             return
-        account.token_expires_at = max(now, account.token_expires_at) + TOKEN_LIFETIME
+        account.token_expires_at = expires_at if expires_at is not None else now + TOKEN_LIFETIME
         account.token_renew_after = 0
         await Store.save(account)
         await self.failures.success(failure_key)
