@@ -11,6 +11,7 @@ from gsuid_core.utils.database import base_models
 from gsuid_core.utils.database.base_models import with_read_session, with_session
 from gsuid_core.utils.database.models import CoreUser, Subscribe
 from gsuid_core.utils.database.startup import exec_list
+from pydantic import ValidationError
 from sqlalchemy import (
     Column,
     Connection,
@@ -33,7 +34,7 @@ from sqlmodel import Field, SQLModel, col, select
 
 from .command_text import command_hint
 from .diagnostics import timed
-from .schema import DatabaseSchemaError, DataError, OpenResult
+from .schema import DatabaseSchemaError, DataError, OpenResult, UserInfo
 
 
 def new_id() -> str:
@@ -110,6 +111,8 @@ class LoginSession(SQLModel, table=True):
     message: str = Field(default="", sa_column=Column(Text, nullable=False))
     result: str = Field(default="{}", sa_column=Column(Text, nullable=False))
     submission: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
+    pending_credential: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
+    bound: bool = False
 
     external_url: str = Field(default="", sa_column=Column(Text, nullable=False))
     external_state: str = Field(default="", max_length=128, repr=False)
@@ -196,6 +199,8 @@ class Notice(SQLModel, table=True):
     last_error: str = Field(default="", max_length=160)
     record_ids: str = Field(default="", sa_column=Column(Text, nullable=False))
     available_clicks: int | None = None
+    task_run_id: str = Field(default="", max_length=32)
+    task_expires_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
 
 
 class SynthesisRecord(SQLModel, table=True):
@@ -233,6 +238,8 @@ class ChestSummary(SQLModel, table=True):
 ADDED_COLUMNS = {
     "wt_login_session": {
         "submission": "TEXT NOT NULL DEFAULT ''",
+        "pending_credential": "TEXT NOT NULL DEFAULT ''",
+        "bound": "BOOLEAN NOT NULL DEFAULT FALSE",
         "external_url": "TEXT NOT NULL DEFAULT ''",
         "external_state": "VARCHAR(128) NOT NULL DEFAULT ''",
         "external_poll_token": "VARCHAR(128) NOT NULL DEFAULT ''",
@@ -266,6 +273,8 @@ ADDED_COLUMNS = {
         "new_checked": "BOOLEAN NOT NULL DEFAULT FALSE",
         "delivery_state": "VARCHAR(16) NOT NULL DEFAULT 'pending'",
         "finished_at": "FLOAT DEFAULT NULL",
+        "task_run_id": "VARCHAR(32) NOT NULL DEFAULT ''",
+        "task_expires_at": "FLOAT DEFAULT NULL",
     },
 }
 exec_list.extend(
@@ -381,7 +390,11 @@ class Store:
         unfinished = col(LoginSession.status).in_(["pending", "verifying", "processing"])
         due = (LoginSession.expires_at <= now) & unfinished
         if startup:
-            due = due | (LoginSession.status == "processing")
+            due = (
+                due
+                | (LoginSession.status == "processing")
+                | ((LoginSession.status == "verifying") & col(LoginSession.bound).is_(True))
+            )
         query = select(LoginSession).where(due)
         if protected_ids:
             query = query.where(col(LoginSession.id).not_in(protected_ids))
@@ -394,22 +407,34 @@ class Store:
         row = await session.get(LoginSession, key)
         if row is None or row.status not in ("pending", "verifying", "processing"):
             return False
-        if row.expires_at > now and not (startup and row.status == "processing"):
+        startup_finish = startup and (row.status == "processing" or (row.status == "verifying" and row.bound))
+        if row.expires_at > now and not startup_finish:
             return False
         interrupted = row.status == "processing"
-        status = "failed" if interrupted else "expired"
-        message = (
-            command_hint("登录处理已中断，请重新发送 wt登录。")
-            if interrupted
-            else command_hint("登录链接已过期，请重新发送 wt登录。")
-        )
+        already_bound = row.status == "verifying" and row.bound
+        if already_bound:
+            status = "success"
+            message = row.message or "登录成功，已绑定为当前账号。"
+            notice_text = message + command_hint("\n若宝箱任务未自动恢复，可发送 wt恢复。")
+        else:
+            status = "failed" if interrupted else "expired"
+            message = (
+                command_hint("登录处理已中断，请重新发送 wt登录。")
+                if interrupted
+                else command_hint("登录链接已过期，请重新发送 wt登录。")
+            )
+            notice_text = message
         deadline = LoginSession.expires_at <= now
         if startup:
-            deadline = or_(deadline, LoginSession.status == "processing")
+            deadline = or_(
+                deadline,
+                LoginSession.status == "processing",
+                (LoginSession.status == "verifying") & col(LoginSession.bound).is_(True),
+            )
         result = await session.execute(
             update(LoginSession)
             .where(LoginSession.id == key, LoginSession.status == row.status, deadline)
-            .values(status=status, submission="", message=message, external_result_pending=False)
+            .values(status=status, submission="", pending_credential="", message=message, external_result_pending=False)
             .execution_options(synchronize_session=False)
         )
         if not isinstance(result, CursorResult):
@@ -419,7 +444,7 @@ class Store:
         notice_id = login_notice_id(key, status)
         if await session.get(Notice, notice_id) is None:
             session.add(
-                Notice(id=notice_id, subscription_id=row.subscription_id, account_id=row.account_id, text=message)
+                Notice(id=notice_id, subscription_id=row.subscription_id, account_id=row.account_id, text=notice_text)
             )
         return True
 
@@ -629,10 +654,12 @@ class Store:
 
     @classmethod
     @with_read_session
-    async def records(cls, session: AsyncSession, ids: list[str]) -> list[ChestRecord]:
+    async def records(cls, session: AsyncSession, ids: list[str], *, strict: bool = True) -> list[ChestRecord]:
         result = await session.execute(select(ChestRecord).where(col(ChestRecord.id).in_(ids)))
         rows = {row.id: row for row in result.scalars().all()}
-        return [rows[key] for key in ids]
+        if strict:
+            return [rows[key] for key in ids]
+        return [rows[key] for key in ids if key in rows]
 
     @classmethod
     @with_session
@@ -664,9 +691,17 @@ class Store:
         # 首次通知仅建立基线；积压的多组结果一起比较，避免更新快照后漏掉后续组的NEW。
         new_ids = owned - set(json.loads(account.bag_snapshot)) if account.bag_snapshot else set()
         for record in result.scalars().all():
-            asset_id = str(OpenResult.model_validate_json(record.result).asset_id) if record.result else ""
-            record.fresh = asset_id in new_ids
-            new_ids.discard(asset_id)
+            asset_id = ""
+            if record.result:
+                try:
+                    asset_id = str(OpenResult.model_validate_json(record.result).asset_id)
+                except (ValidationError, ValueError) as error:
+                    logger.warning(
+                        f"[WuwaTappoUID] 开箱流水 {record.id} 解析失败，跳过本条 NEW 判定：{type(error).__name__}"
+                    )
+            record.fresh = bool(asset_id) and asset_id in new_ids
+            if asset_id:
+                new_ids.discard(asset_id)
             session.add(record)
         account.bag_snapshot = json.dumps(sorted(owned), separators=(",", ":"))
         session.add(account)
@@ -815,6 +850,71 @@ class Store:
             .values(submitted=True, submitted_at=now, delivery_state="submitted", finished_at=now, last_error="")
             .execution_options(synchronize_session=False)
         )
+
+    @classmethod
+    @timed("database-write", slow=2)
+    @with_session
+    async def mark_superseded(cls, session: AsyncSession, ids: list[str], reason: str = "提醒已失效") -> set[str]:
+        if not ids:
+            return set()
+        now = time.time()
+        result = await session.execute(
+            select(Notice).where(col(Notice.id).in_(ids), Notice.delivery_state == "pending")
+        )
+        rows = list(result.scalars().all())
+        if not rows:
+            return set()
+        affected: set[tuple[str, str]] = set()
+        for row in rows:
+            row.delivery_state = "superseded"
+            row.finished_at = now
+            row.last_error = reason[:160]
+            session.add(row)
+            if row.account_id and row.task_run_id:
+                affected.add((row.account_id, row.task_run_id))
+        await session.flush()
+        reset_accounts: set[str] = set()
+        for account_id, run_id in affected:
+            task = await session.get(ChestTask, account_id)
+            if task is None or task.run_id != run_id or not task.reminded or task.status not in ("active", "paused"):
+                continue
+            existing = await session.execute(
+                select(Notice.task_expires_at).where(
+                    Notice.account_id == account_id,
+                    Notice.task_run_id == run_id,
+                    col(Notice.delivery_state).in_(["pending", "submitted"]),
+                )
+            )
+            already_covered = any(
+                expires is not None and abs(task.expires_at - expires) <= 1.0 for expires in existing.scalars().all()
+            )
+            if not already_covered:
+                task.reminded = False
+                session.add(task)
+                reset_accounts.add(account_id)
+        return reset_accounts
+
+    @classmethod
+    @timed("database-write", slow=2)
+    @with_session
+    async def record_chest_open(
+        cls, session: AsyncSession, account_id: str, info_json: str, verified_at: float, record: ChestRecord
+    ) -> bool:
+        """原子写入开箱流水并累增同轮任务成功数；按流水主键幂等，防止补写重复计数。"""
+        if await session.get(ChestRecord, record.id) is not None:
+            return False
+        session.add(record)
+        account = await session.get(Account, account_id)
+        if account is not None:
+            merged = UserInfo.model_validate_json(info_json).merge_saved(account.info)
+            account.info = merged.model_dump_json()
+            account.verified_at = max(account.verified_at, verified_at)
+            session.add(account)
+        task = await session.get(ChestTask, account_id)
+        if task is not None and task.run_id == record.run_id:
+            task.successes += 1
+            session.add(task)
+        return True
 
     @classmethod
     @timed("database-write", slow=2)

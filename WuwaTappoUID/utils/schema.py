@@ -95,6 +95,10 @@ class MaintenanceError(WuwaError):
 class DataError(WuwaError):
     """响应数据不符合当前接口结构。"""
 
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
+
 
 class DatabaseSchemaError(WuwaError):
     """插件表结构不完整，不能继续账号操作或恢复后台任务。"""

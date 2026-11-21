@@ -198,8 +198,10 @@ class RuntimeOwner:
             except TimeoutError:
                 await self.service.failures.fail("reload", "热重载交接", "旧操作仍未结束，新实例继续等待。", limit=1)
                 await pending
+        await self.service.flush_all_pending_writes()
         await self.resources.close()
         checkpoints = self.login.export_checkpoints()
+        pending_writes = self.service.export_pending_writes()
         failures = {key: value.model_dump(mode="json") for key, value in self.service.failures._failures.items()}
         await self.api.close()
         self.service.cards._avatars.clear()
@@ -208,7 +210,7 @@ class RuntimeOwner:
 
         images.items.clear()
         images.bytes = 0
-        return {"checkpoints": checkpoints, "failures": failures}
+        return {"checkpoints": checkpoints, "pending_writes": pending_writes, "failures": failures}
 
     async def activate(self, *, start: bool = False) -> None:
         self._start_requested = self._start_requested or start
@@ -241,6 +243,8 @@ async def _activate_latest() -> None:
         while slot.latest is not None:
             owner = slot.latest
             owner.login.import_checkpoints(transfer.get("checkpoints", []))
+            if "pending_writes" in transfer:
+                owner.service.import_pending_writes(transfer["pending_writes"])
             await owner._run_registered(owner.initialize)
             from .failures import Failure
 

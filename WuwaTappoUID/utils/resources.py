@@ -28,6 +28,7 @@ from .schema import (
 from .settings import retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
+TEMP_FAILURE_COOLDOWN = 3600.0
 CacheModel = TypeVar("CacheModel", bound=BaseModel)
 DiskResult = TypeVar("DiskResult")
 DiskArgs = ParamSpec("DiskArgs")
@@ -50,10 +51,17 @@ class CacheHeaders(BaseModel):
     last_modified: str = ""
 
 
+class FailedAsset(BaseModel):
+    reason: str = ""
+    retry_after: float = 0.0
+    permanent: bool = False
+
+
 class ResourceState(BaseModel):
     assets_host: str = DEFAULT_HOST
     headers: dict[str, CacheHeaders] = {}
     sources: dict[str, str] = {}
+    failed_urls: dict[str, FailedAsset] = {}
 
 
 class Catalog(BaseModel):
@@ -85,6 +93,11 @@ class Resources:
     @property
     def assets_host(self) -> str:
         return self.state.assets_host
+
+    @property
+    def next_retry_at(self) -> float | None:
+        times = [entry.retry_after for entry in self.state.failed_urls.values() if not entry.permanent]
+        return min(times) if times else None
 
     async def load(self) -> None:
         state = await self._load_cache(self.state_path, ResourceState)
@@ -266,10 +279,14 @@ class Resources:
                 raise
             except (WuwaError, OSError) as error:
                 problems.append(self._error("图鉴目录更新", error))
-            updated, skipped, failed, deferred, repaired = await self._sync_images(force)
-            messages.append(
-                f"物品图：下载 {updated}（损坏修复 {repaired}），跳过 {skipped}，失败 {failed}，待补齐 {deferred}。"
+            updated, skipped, failed, deferred, repaired, cooldown, permanent_failed = await self._sync_images(force)
+            detail = (
+                f"物品图：下载 {updated}（损坏修复 {repaired}），跳过 {skipped}，失败 {failed}，待补齐 {deferred}"
+                + (f"，冷却待重试 {cooldown}" if cooldown else "")
+                + (f"，永久失效 {permanent_failed}" if permanent_failed else "")
+                + "。"
             )
+            messages.append(detail)
             if failed or deferred:
                 problems.append("部分图片下载失败，后续普通更新会继续补齐。")
         if not problems:
@@ -306,10 +323,15 @@ class Resources:
         # 清单 URL 带版本参数；地址或版本变化就对应新文件，未变化的图片直接复用。
         return self.raw_dir / f"{hashlib.sha256(url.encode()).hexdigest()}.png"
 
-    async def _sync_images(self, force: bool) -> tuple[int, int, int, int, int]:
+    async def _sync_images(self, force: bool) -> tuple[int, int, int, int, int, int, int]:
         assert self.manifest is not None
         images = (*self.manifest.images().values(), *self.manifest.head_images().values())
         urls = sorted({self._image_url(relative) for relative in images})
+        url_set = set(urls)
+        if force:
+            self.state.failed_urls.clear()
+        else:
+            self.state.failed_urls = {url: entry for url, entry in self.state.failed_urls.items() if url in url_set}
         semaphore = asyncio.Semaphore(4)
         consecutive_failures = 0
 
@@ -325,17 +347,38 @@ class Resources:
                         except DataError:
                             damaged = True
                         else:
+                            self.state.failed_urls.pop(url, None)
                             return "skipped"
-                    # 连续失败后不再发起本轮剩余下载；在途请求正常收尾。
+                    if not force and url in self.state.failed_urls:
+                        entry = self.state.failed_urls[url]
+                        if entry.permanent:
+                            return "permanent_failed"
+                        if entry.retry_after > time.time():
+                            return "cooldown"
+                    # 资源站连续临时故障达到上限后再中止本轮剩余下载；单张失效或拒绝不阻塞其他素材。
                     if consecutive_failures >= retry_limit():
                         return "deferred"
                     raw = await self.api.fetch_bytes(url)
                     await self.disk(self._verify_image, raw)
                     async with self.raw_cache_lock:
                         await self.disk(self._write_file, path, raw)
+                    self.state.failed_urls.pop(url, None)
                     consecutive_failures = 0
                     return "repaired" if damaged else "updated"
+                except DataError as error:
+                    if error.permanent:
+                        self.state.failed_urls[url] = FailedAsset(reason=str(error), permanent=True)
+                        logger.warning(f"[WuwaTappoUID] {self._error('物品图永久失效已跳过', error)}")
+                        return "permanent_failed"
+                    self.state.failed_urls[url] = FailedAsset(
+                        reason=str(error), retry_after=time.time() + TEMP_FAILURE_COOLDOWN, permanent=False
+                    )
+                    logger.warning(f"[WuwaTappoUID] {self._error('物品图临时异常已进入冷却', error)}")
+                    return "cooldown"
                 except (WuwaError, OSError, ValueError) as error:
+                    self.state.failed_urls[url] = FailedAsset(
+                        reason=str(error), retry_after=time.time() + TEMP_FAILURE_COOLDOWN, permanent=False
+                    )
                     consecutive_failures += 1
                     if consecutive_failures == 1:
                         logger.warning(f"[WuwaTappoUID] {self._error('物品图下载', error)}")
@@ -350,6 +393,8 @@ class Resources:
             results.count("failed"),
             results.count("deferred"),
             results.count("repaired"),
+            results.count("cooldown"),
+            results.count("permanent_failed"),
         )
 
     @staticmethod

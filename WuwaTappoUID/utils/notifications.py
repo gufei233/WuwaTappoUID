@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -10,15 +11,16 @@ from gsuid_core.gss import gss
 from gsuid_core.logger import logger
 from gsuid_core.models import Event, Message
 from gsuid_core.segment import MessageSegment
+from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from .cards import ResultContext
 from .command_text import command_prefix
-from .database import Account, Notice, Store
+from .database import Account, ChestTask, Notice, Store
 from .diagnostics import measure
 from .formatting import mask_cuid
 from .render_common import Progress
-from .schema import ApiError, AuthenticationError, DataError, MaintenanceError, NetworkError, WuwaError
+from .schema import ApiError, AuthenticationError, DataError, MaintenanceError, NetworkError, OpenResult, WuwaError
 from .settings import bot_name
 
 if TYPE_CHECKING:
@@ -158,6 +160,16 @@ async def _flush_notices(service: "Service") -> None:
         service.wake_notices(5)
 
 
+def _renew_reminder_valid(notice: Notice, task: ChestTask | None, now: float) -> bool:
+    if not notice.task_run_id:
+        return True
+    if task is None or task.status != "active" or task.run_id != notice.task_run_id:
+        return False
+    if notice.task_expires_at is not None and abs(task.expires_at - notice.task_expires_at) > 1.0:
+        return False
+    return task.remaining(now) > 0
+
+
 async def _flush_account_notices(service: "Service", key: str) -> None:
     if service.closing or not service.database_ready:
         return
@@ -251,6 +263,32 @@ async def _flush_account_notices(service: "Service", key: str) -> None:
                 )
                 if unchecked and not failure.blocked:
                     return
+    # 背包核对可能触发鉴权暂停，因此在提交推送前再按最新任务状态过滤续期提醒。
+    if key and any(notice.task_run_id for _, notices in available.values() for notice in notices):
+        if service.account_lock(key).locked():
+            service._notice_again = True
+            return
+        current_task = await Store.task(key)
+        now = time.time()
+        stale_ids: list[str] = []
+        filtered: dict[int, tuple[Event, list[Notice]]] = {}
+        for subscription_id, (event, notices) in available.items():
+            kept = []
+            for notice in notices:
+                if _renew_reminder_valid(notice, current_task, now):
+                    kept.append(notice)
+                else:
+                    stale_ids.append(notice.id)
+            if kept:
+                filtered[subscription_id] = event, kept
+        if stale_ids:
+            reset_accounts = await Store.mark_superseded(stale_ids)
+            if key in reset_accounts and current_task is not None and current_task.status == "active":
+                service.schedule(current_task, run_at=now + 1)
+        available = filtered
+        if not available:
+            await service.failures.success("notice-account:" + key)
+            return
     # 登录态失效时拿不到背包快照：待判 NEW 的结果留到登录恢复后再出图，其余通知照常发送。
     waiting = account is not None and account.token_state in ("expired", "recovering")
     fallback_sent = False
@@ -277,6 +315,38 @@ async def _flush_account_notices(service: "Service", key: str) -> None:
     await service.failures.success("notice-account:" + key)
 
 
+async def _fallback_record_lines(service: "Service", notice: Notice) -> list[str]:
+    if not notice.record_ids:
+        return []
+    try:
+        record_ids = json.loads(notice.record_ids)
+    except ValueError as error:
+        logger.warning(f"[WuwaTappoUID] 文字兜底解析流水列表失败，仅发送汇总标题：{type(error).__name__}")
+        return []
+    if not isinstance(record_ids, list) or not record_ids:
+        return []
+    records = await Store.records(record_ids, strict=False)
+    counts: Counter[str] = Counter()
+    fresh_names: set[str] = set()
+    for record in records:
+        if not record.result:
+            name = "物品信息未收到"
+        else:
+            try:
+                result = OpenResult.model_validate_json(record.result)
+                name = service.cards.item_name(result.asset_id, result.asset_name)
+            except (ValidationError, ValueError):
+                name = "物品信息异常"
+            else:
+                if record.fresh:
+                    fresh_names.add(name)
+        counts[name] += 1
+    missing = len(record_ids) - len(records)
+    if missing > 0:
+        counts["物品信息缺失"] += missing
+    return [f"- {name} ×{count}{' [NEW]' if name in fresh_names else ''}" for name, count in counts.items()]
+
+
 async def _send_notice_group(
     service: "Service",
     key: str,
@@ -297,13 +367,13 @@ async def _send_notice_group(
     if not service.failures.blocked(render_key) and not service.failures.allows(render_key):
         return False
     contexts = {}
-    contents: list[Message] = []
+    rendered: list[tuple[Notice, list[Message]]] = []
     if not service.failures.blocked(render_key) and not (unchecked and service.failures.blocked("notice-bag:" + key)):
         try:
             if any(notice.record_ids for notice in notices) and account is not None:
                 contexts[key] = ResultContext(await service.cards.header(account, None, event), progress)
             for notice in notices:
-                contents.extend(await service.notice_messages(notice, event, account, contexts))
+                rendered.append((notice, await service.notice_messages(notice, event, account, contexts)))
             await service.failures.success(render_key)
         except SQLAlchemyError:
             raise
@@ -315,12 +385,31 @@ async def _send_notice_group(
             failure = await service.failures.fail(render_key, "通知图片绘制", service.error_detail(error), key)
             if not failure.blocked:
                 return False
+    # 渲染期间可能发生暂停或续期，真正提交消息前再次按最新任务状态过滤续期提醒。
+    if key and any(notice.task_run_id for notice in notices):
+        if service.account_lock(key).locked():
+            service._notice_again = True
+            return False
+        current_task = await Store.task(key)
+        now = time.time()
+        stale_ids = [notice.id for notice in notices if not _renew_reminder_valid(notice, current_task, now)]
+        if stale_ids:
+            stale_set = set(stale_ids)
+            reset_accounts = await Store.mark_superseded(stale_ids)
+            if key in reset_accounts and current_task is not None and current_task.status == "active":
+                service.schedule(current_task, run_at=now + 1)
+            notices = [notice for notice in notices if notice.id not in stale_set]
+            rendered = [(notice, items) for notice, items in rendered if notice.id not in stale_set]
+            if not notices:
+                return False
+    contents: list[Message] = [item for _, items in rendered for item in items]
     fallback = not contents or service.failures.blocked(render_key)
     if fallback:
         lines = ["结果图片暂不可用，以下为本次文字通知："]
         for notice in notices:
             text = notice.text.replace(account.cuid, mask_cuid(account.cuid)) if account else notice.text
             lines.append(text)
+            lines.extend(await _fallback_record_lines(service, notice))
         contents = [MessageSegment.text("\n".join(lines))]
     messages = [MessageSegment.node(contents)] if sum(m.type == "image" for m in contents) > 1 else contents
     if event.user_type == "group":

@@ -24,7 +24,7 @@ from .database import LoginSession, Store
 from .diagnostics import measure
 from .formatting import mask_cuid
 from .login_card import render_login
-from .login_store import LoginStore
+from .login_store import LoginStore, PendingCredential
 from .render_cache import render_in_thread
 from .schema import CN_SERVER_ID, ApiError, DataError, LoginData, SdkLogin, UserInfo, WuwaError, token_expiry
 from .service import Service, account_id, identity
@@ -65,7 +65,6 @@ class PendingLoginCheckpoint(BaseModel):
     message: str = ""
     result: str = "{}"
     notice_text: str = ""
-    expire_account: bool = False
     attempts: int = 0
     retry_after: float = 0
 
@@ -253,18 +252,28 @@ class LoginManager:
                     row.external_url = base
                     row.external_state = state
                     row.external_poll_token = remote.poll_token
+                to_revoke: list[LoginSession] = []
+                finalized_bound = False
                 for old in opened:
+                    if old.status == "verifying" and old.bound:
+                        if await Store.finish_login(old.id, time.time(), startup=True):
+                            finalized_bound = True
+                        continue
                     old.status = "revoked"
                     old.message = "该链接已被新的登录链接替代，请使用最新链接。"
                     old.submission = ""
+                    old.pending_credential = ""
                     old.external_synced = True
                     old.external_poll_token = ""
                     old.external_result_pending = False
                     self._remote_retries.pop(old.id, None)
-                await Store.save(*opened, row)
+                    to_revoke.append(old)
+                await Store.save(*to_revoke, row)
                 for old in opened:
                     if old.id in self._wake_events:
                         self._wake_events[old.id].set()
+                if finalized_bound:
+                    self.wake_notices()
         if remote is not None:
             self.ensure_worker(key, external=True)
         url = base + "/wuwatappouid/i/" + state
@@ -412,19 +421,66 @@ class LoginManager:
                 else:
                     async with self.service.account_lock(row.account_id):
                         account = await Store.account(row.account_id)
-                        if account is None or session_key(account.token) != row.token_digest:
-                            raise WuwaError(command_hint("本次登录凭据已被更新，请重新发送 wt登录。"))
-                        checkpoint = PendingLoginCheckpoint(
-                            key=key,
-                            owner_id=row.owner_id,
-                            account_id=account.id,
-                            cuid=account.cuid,
-                            phase="verify",
-                            token=account.token,
-                            token_expires_at=account.token_expires_at,
-                        )
-                        self._checkpoints[key] = checkpoint
-                        await self._continue_checkpoint(checkpoint)
+                        if row.bound:
+                            # 本会话的绑定事务已提交，重启后只收尾登录结果，不再重建绑定以免覆盖用户后续的切换或解绑。
+                            message = row.message or "登录成功，已绑定为当前账号。"
+                            checkpoint = PendingLoginCheckpoint(
+                                key=key,
+                                owner_id=row.owner_id,
+                                account_id=row.account_id,
+                                cuid=account.cuid if account is not None else "",
+                                phase="outcome",
+                                outcome_status="success",
+                                message=message,
+                                result=row.result,
+                                notice_text=message + command_hint("\n若宝箱任务未自动恢复，可发送 wt恢复。"),
+                            )
+                            self._checkpoints[key] = checkpoint
+                            await self._continue_checkpoint(checkpoint)
+                        elif not row.pending_credential:
+                            if (
+                                account is not None
+                                and account.token
+                                and session_key(account.token) == row.token_digest
+                                and account.token_state in ("pending", "ready")
+                            ):
+                                # 兼容 0.1.62 升级前存于 Account 的未绑定待验证会话（原用户刷新可能已标为 ready）。
+                                checkpoint = PendingLoginCheckpoint(
+                                    key=key,
+                                    owner_id=row.owner_id,
+                                    account_id=account.id,
+                                    cuid=account.cuid,
+                                    phase="verify",
+                                    expected_digest=row.token_digest,
+                                    token=account.token,
+                                    token_expires_at=account.token_expires_at,
+                                )
+                                self._checkpoints[key] = checkpoint
+                                await self._continue_checkpoint(checkpoint)
+                            else:
+                                raise WuwaError(command_hint("本次登录凭据已失效，请重新发送 wt登录。"))
+                        else:
+                            cred = PendingCredential.model_validate_json(row.pending_credential)
+                            if session_key(cred.token) != row.token_digest:
+                                raise WuwaError(command_hint("本次登录凭据已失效，请重新发送 wt登录。"))
+                            current = session_key(account.token) if account is not None and account.token else ""
+                            if current != cred.expected_digest:
+                                raise WuwaError(command_hint("本次登录凭据已被更新，请重新发送 wt登录。"))
+                            checkpoint = PendingLoginCheckpoint(
+                                key=key,
+                                owner_id=row.owner_id,
+                                account_id=row.account_id,
+                                cuid=cred.cuid,
+                                phase="verify",
+                                expected_digest=cred.expected_digest,
+                                old_token=account.token if account is not None else "",
+                                token=cred.token,
+                                sdk=cred.sdk,
+                                sdk_expires_at=cred.sdk_expires_at,
+                                token_expires_at=cred.token_expires_at,
+                            )
+                            self._checkpoints[key] = checkpoint
+                            await self._continue_checkpoint(checkpoint)
             except (DatabaseWriteTimeout, WriteGateTimeout):
                 raise
             except SQLAlchemyError as error:
@@ -506,11 +562,15 @@ class LoginManager:
                 if not saved:
                     await self._superseded(checkpoint)
                     return
-                self.service.api.retire_token(checkpoint.old_token)
                 checkpoint.phase = "verify"
             if checkpoint.phase == "verify":
+                current_row = await Store.login_session(key)
+                if current_row is None or current_row.status != "verifying" or current_row.token_digest != token_digest:
+                    await self._superseded(checkpoint)
+                    return
                 account = await Store.account(checkpoint.account_id)
-                if account is None or session_key(account.token) != token_digest:
+                current = session_key(account.token) if account is not None and account.token else ""
+                if current != checkpoint.expected_digest:
                     await self._superseded(checkpoint)
                     return
                 try:
@@ -528,7 +588,6 @@ class LoginManager:
                     )
                     if isinstance(error, DataError):
                         checkpoint.outcome_status = "failed"
-                    checkpoint.expire_account = isinstance(error, ApiError) and error.is_auth
                     checkpoint.message = str(error)
                     checkpoint.notice_text = str(error) + (
                         "\n请重新打开原链接，点击继续登录。"
@@ -541,9 +600,14 @@ class LoginManager:
                     checkpoint.phase = "bind"
             if checkpoint.phase == "bind":
                 assert checkpoint.info is not None
-                if not await LoginStore.bind(key, token_digest, checkpoint.info, checkpoint.token_expires_at):
+                bound, old_token = await LoginStore.bind(
+                    key, token_digest, checkpoint.info, checkpoint.token_expires_at
+                )
+                if not bound:
                     await self._superseded(checkpoint)
                     return
+                if old_token:
+                    self.service.api.retire_token(old_token)
                 account = await Store.account(checkpoint.account_id)
                 assert account is not None
                 # 绑定已提交后先保留最终结果，后续保存失败不重复恢复任务。
@@ -595,7 +659,6 @@ class LoginManager:
                     checkpoint.message,
                     checkpoint.result,
                     checkpoint.notice_text,
-                    checkpoint.expire_account,
                 )
                 if not saved:
                     await self._superseded(checkpoint)
@@ -623,7 +686,6 @@ class LoginManager:
         checkpoint.message = command_hint("本次登录凭据已被更新，本次未覆盖新登录态，请重新发送 wt登录。")
         checkpoint.result = "{}"
         checkpoint.notice_text = checkpoint.message
-        checkpoint.expire_account = False
         await LoginStore.outcome(checkpoint.key, "", "failed", checkpoint.message, "{}", checkpoint.message)
         self._checkpoints.pop(checkpoint.key, None)
         self.wake_notices()

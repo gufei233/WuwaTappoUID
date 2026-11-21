@@ -15,7 +15,7 @@ from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
 from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from sqlalchemy.exc import SQLAlchemyError
 
-from ..runtime import login, resources, service
+from ..runtime import login, resources, schedule_resource_retry, service
 from ..utils.api import with_read_cache
 from ..utils.backpack import BagFilter
 from ..utils.buttons import query_buttons
@@ -188,9 +188,12 @@ async def _execute_command(bot: Bot, event: Event, request_scope: AsyncExitStack
                 raise WuwaError("强制更新资源仅限 Bot 管理员使用。")
             await bot.send("开始更新中文名称与物品图库，完成后会回复统计结果。")
             await service.failures.success("resources")
-            replies = [await resources.update(force=force)]
-            if resources.incomplete:
-                await service.failures.fail("resources", "资源更新", replies[0])
+            try:
+                replies = [await resources.update(force=force)]
+                if resources.incomplete:
+                    await service.failures.fail("resources", "资源更新", replies[0], blocked_delay=900)
+            finally:
+                schedule_resource_retry()
         else:
             replies = [help_text(get_plugin_available_prefix("WuwaTappoUID"))]
     except AuthenticationError as error:

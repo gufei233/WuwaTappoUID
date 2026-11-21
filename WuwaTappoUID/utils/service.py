@@ -8,6 +8,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from gsuid_core.aps import scheduler
@@ -16,6 +17,7 @@ from gsuid_core.models import Event, Message
 from gsuid_core.subscribe import gs_subscribe
 from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
 from gsuid_core.utils.database.write_gate import WriteGateTimeout
+from pydantic import BaseModel, JsonValue, ValidationError
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from . import notifications, synthesis_service
@@ -23,7 +25,7 @@ from .api import WuwaAPI, with_read_cache
 from .backpack import BagFilter
 from .cards import Cards, ResultContext
 from .command_text import command_hint, command_prefix
-from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, new_id
+from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .diagnostics import Diagnostics, MeasuredLock, measure
 from .failures import Failures
 from .formatting import account_text, date_text, mask_cuid, remaining_text, task_text
@@ -78,6 +80,68 @@ def account_id(cuid: str, domestic: int) -> str:
     return f"{domestic}:{cuid}"
 
 
+class PendingOpen(BaseModel):
+    id: str
+    account_id: str
+    run_id: str
+    subscription_id: int
+    side: str
+    created_at: float
+    before_info: str
+    result: str
+    supplement: str
+    info_json: str
+    verified_at: float
+
+    def to_record(self) -> ChestRecord:
+        return ChestRecord(
+            id=self.id,
+            account_id=self.account_id,
+            run_id=self.run_id,
+            subscription_id=self.subscription_id,
+            side=self.side,
+            created_at=self.created_at,
+            state="success",
+            before_info=self.before_info,
+            result=self.result,
+            supplement=self.supplement,
+        )
+
+
+class PendingSynthesis(BaseModel):
+    id: str
+    run_id: str
+    account_id: str
+    created_at: float
+    mode: str
+    material_ids: str
+    before_quantity: int
+    after_quantity: int | None = None
+    state: str = "success"
+    result: str = ""
+    error: str = ""
+
+    def to_record(self) -> SynthesisRecord:
+        return SynthesisRecord(
+            id=self.id,
+            run_id=self.run_id,
+            account_id=self.account_id,
+            created_at=self.created_at,
+            mode=self.mode,
+            material_ids=self.material_ids,
+            before_quantity=self.before_quantity,
+            after_quantity=self.after_quantity,
+            state=self.state,
+            result=self.result,
+            error=self.error,
+        )
+
+
+class PendingWrites(BaseModel):
+    opens: list[PendingOpen] = []
+    synthesis: list[PendingSynthesis] = []
+
+
 class Service:
     runtime: "RuntimeOwner"
 
@@ -97,6 +161,10 @@ class Service:
         self._notice_sends: dict[int, NoticeSendGate] = {}
         self._notice_images: OrderedDict[str, CachedNoticeImage] = OrderedDict()
         self._notice_image_bytes = 0
+        self._pending_opens: dict[str, list[PendingOpen]] = {}
+        self._pending_synthesis: dict[str, PendingSynthesis] = {}
+        self._pending_path = resources.root / "pending-writes.json"
+        self._pending_write_lock = asyncio.Lock()
         self._archive_days: int | None = None
         self._archive_next = 0.0
         self.closing = False
@@ -148,6 +216,7 @@ class Service:
             task.status = "paused"
             task.pause_reason = "route"
             task.paused_at = None
+            task.next_check = task.expires_at
             await Store.save(task)
             self.schedule(task)
         await self.failures.fail(
@@ -196,6 +265,7 @@ class Service:
         if failure.blocked:
             task.status = "paused"
             task.pause_reason = "failure"
+            task.next_check = task.expires_at
             await Store.save(
                 task,
                 Notice(
@@ -284,10 +354,13 @@ class Service:
         account.token_state = "expired"
         task = await Store.task(account.id)
         announced = False
+        was_active = False
         if task is not None and task.status in ("active", "paused"):
-            if task.status == "active":
+            was_active = task.status == "active"
+            if was_active:
                 task.status = "paused"
                 task.pause_reason = "auth"
+                task.next_check = task.expires_at
             rows = [account, task]
             if not was_expired:
                 rows.append(
@@ -327,6 +400,13 @@ class Service:
             announced = bool(notices)
 
         self.api.retire_token(account.token)
+        if was_active:
+            try:
+                await self.queue_results(account.id, force=True, reason="任务中断，汇总已开结果")
+            except (DatabaseWriteTimeout, WriteGateTimeout) as error:
+                logger.warning(
+                    f"[WuwaTappoUID] 鉴权暂停后暂未能入队开箱汇总，将由后台巡检补发：{self.error_detail(error)}"
+                )
         return announced
 
     async def account_notice(self, account: Account, text: str) -> None:
@@ -444,6 +524,9 @@ class Service:
         if task.remaining() <= 0:
             await self.finish(task, "expired", "本轮已到期", notify=False)
             return command_hint("原宝箱任务已到期，发送 wt宝箱 可开启新一轮。")
+        # 暂停瞬间若开箱流水或结果入队曾超时，恢复为 active 前先补写再入队，避免余量继续滞留。
+        await self._flush_pending_opens(account.id, task)
+        await self.queue_results(account.id, force=True, reason="任务中断，汇总已开结果")
         if task.paused_at is not None:
             task.expires_at += time.time() - task.paused_at
         task.paused_at = None
@@ -677,18 +760,25 @@ class Service:
             grouped.setdefault((record.run_id, record.subscription_id), []).append(record)
         info = UserInfo.model_validate_json(account.info) if account.info else None
         task = await Store.task(key)
+        unbound = not account.token and account.token_state == "expired"
         for (run_id, subscription_id), records in grouped.items():
-            send_rest = force or task is None or task.run_id != run_id or task.status not in ("active", "paused")
+            send_rest = force or unbound or task is None or task.run_id != run_id or task.status != "active"
             while records and (send_rest or account.subscribed and len(records) >= 10):
                 # 订阅按十件推送；未订阅保留整轮通知，绘图入口按页绘制。
                 size = min(len(records), 10) if account.subscribed else len(records)
                 batch, records = records[:size], records[size:]
+                text = (
+                    f"本次 {len(batch)} 个 · 账号已解绑，未判定物品不标 NEW"
+                    if unbound
+                    else f"{reason + ' · ' if reason else ''}本次 {len(batch)} 个 · {date_text(batch[-1].created_at)}"
+                )
                 notice = Notice(
                     subscription_id=subscription_id,
                     account_id=key,
-                    text=f"{reason + ' · ' if reason else ''}本次 {len(batch)} 个 · {date_text(batch[-1].created_at)}",
+                    text=text,
                     record_ids=json.dumps([r.id for r in batch]),
                     available_clicks=info.remaining if info else None,
+                    new_checked=unbound,
                 )
                 for record in batch:
                     record.notice_id = notice.id
@@ -894,7 +984,7 @@ class Service:
     def job_id(self, key: str) -> str:
         return "WuwaTappoUID:chest:" + key
 
-    def schedule(self, task: ChestTask) -> None:
+    def schedule(self, task: ChestTask, *, run_at: float | None = None) -> None:
         if not self.runtime.active:
             return
         if task.timer_paused:
@@ -906,13 +996,13 @@ class Service:
             self.failures.blocked("check:" + task.account_id) or self.failures.blocked("save:" + task.account_id)
         ):
             return
+        target_time = (
+            run_at if run_at is not None else (task.expires_at if task.status == "paused" else task.next_check)
+        )
         scheduler.add_job(
             self.tick,
             "date",
-            run_date=datetime.fromtimestamp(
-                max(time.time() + 0.1, task.expires_at if task.pause_reason in ("auth", "route") else task.next_check),
-                timezone.utc,
-            ),
+            run_date=datetime.fromtimestamp(max(time.time() + 0.1, target_time), timezone.utc),
             args=[task.account_id],
             id=self.job_id(task.account_id),
             name="WuwaTappo 账号宝箱检查",
@@ -932,6 +1022,8 @@ class Service:
 
     def next_wakeup(self, task: ChestTask, info: UserInfo | None, retry: bool = False) -> float:
         now = time.time()
+        if task.status == "paused":
+            return max(now + 0.1, task.expires_at)
         if retry:
             # 失败后不使用已经过去的提醒/到期点，避免 0.1 秒循环。
             wakeup = max(now + 60, self.failures.retry_after("check:" + task.account_id))
@@ -940,11 +1032,10 @@ class Service:
         if not task.reminded:
             # 剩余不超过 1 小时进入提醒与续期窗口。
             candidates.append(task.expires_at - RENEW_WINDOW)
-        if task.status == "active":
-            if retry or info is None:
-                candidates.append(now + 60)
-            else:
-                candidates.extend(max(now + 5, info.cooldown(side)) for side in ("left", "right"))
+        if info is None:
+            candidates.append(now + 60)
+        else:
+            candidates.extend(max(now + 5, info.cooldown(side)) for side in ("left", "right"))
         return max(now + 0.1, min(candidates))
 
     async def start_or_renew(self, event: Event) -> list[str | bytes]:
@@ -973,6 +1064,15 @@ class Service:
                     if 0 < task.remaining(now) <= RENEW_WINDOW:
                         task.expires_at += hours * 3600
                         task.reminded = False
+                        if task.status == "paused":
+                            task.next_check = task.expires_at
+                        else:
+                            latest = await Store.account(account.id)
+                            if latest is not None:
+                                account = latest
+                            saved_info = UserInfo.model_validate_json(account.info) if account.info else None
+                            retrying = self.failures.attempts("check:" + account.id) > 0
+                            task.next_check = self.next_wakeup(task, saved_info, retry=retrying)
                         action += f"已在原到期时间上续期 {hours} 小时。"
                     await Store.save(task)
                     self.schedule(task)
@@ -993,6 +1093,8 @@ class Service:
                             next_check=now,
                         )
                         await Store.save(task)
+                    await self.failures.reset("check:" + account.id)
+                    await self.failures.reset("save:" + account.id)
                     self.schedule(task)
                     action = f"已开启 {hours} 小时自动开箱，将立即检查左右宝箱。"
                 answer = action
@@ -1001,7 +1103,13 @@ class Service:
         return [answer, image]
 
     async def finish(self, task: ChestTask, status: str, reason: str, *, notify: bool = True) -> None:
-        # 先持久化结束状态并撤销调度，结果汇总失败不能阻止任务停止。
+        # 先补写当前账号已确认但待落库的开箱流水，再持久化结束状态并撤销调度。
+        try:
+            await self._flush_pending_opens(task.account_id, task)
+        except (DatabaseWriteTimeout, WriteGateTimeout) as error:
+            logger.warning(
+                f"[WuwaTappoUID] 任务结束前补写开箱流水超时，将由后台巡检继续补写：{self.error_detail(error)}"
+            )
         task.status = status
         task.paused_at = None
         await Store.save(task)
@@ -1190,6 +1298,9 @@ class Service:
                         async with self.subscription(event, "WuwaTappo宝箱", new_id()) as subscription_id:
                             task.subscription_id = subscription_id
                             await Store.save(task)
+                    if task.status == "paused":
+                        await self._flush_pending_opens(account.id, task)
+                        await self.queue_results(account.id, force=True, reason="任务中断，汇总已开结果")
                     if task.paused_at is not None:
                         task.expires_at += time.time() - task.paused_at
                     task.paused_at = None
@@ -1202,6 +1313,141 @@ class Service:
                     answer = prefix + "宝箱任务已恢复，继续原轮次。\n" + task_text(task)
         self.wake_notices()
         return answer
+
+    @staticmethod
+    def _write_pending_file(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".tmp")
+        temp.write_bytes(data)
+        temp.replace(path)
+
+    @staticmethod
+    def _remove_pending_file(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+
+    async def save_pending_writes(self) -> None:
+        payload = PendingWrites(
+            opens=[item for items in self._pending_opens.values() for item in items],
+            synthesis=list(self._pending_synthesis.values()),
+        )
+        async with self._pending_write_lock:
+            try:
+                if not payload.opens and not payload.synthesis:
+                    await asyncio.to_thread(self._remove_pending_file, self._pending_path)
+                else:
+                    await asyncio.to_thread(
+                        self._write_pending_file, self._pending_path, payload.model_dump_json().encode()
+                    )
+            except OSError as error:
+                logger.error(f"[WuwaTappoUID] 待补写队列落盘失败：{error}")
+
+    async def load_pending_writes(self) -> None:
+        async with self._pending_write_lock:
+            if not self._pending_path.exists():
+                return
+            try:
+                raw = await asyncio.to_thread(self._pending_path.read_text, "utf-8")
+                payload = PendingWrites.model_validate_json(raw)
+            except (OSError, ValidationError) as error:
+                logger.error(f"[WuwaTappoUID] 待补写队列文件读取失败，已忽略损坏数据：{error}")
+                return
+        for item in payload.opens:
+            bucket = self._pending_opens.setdefault(item.account_id, [])
+            if all(existing.id != item.id for existing in bucket):
+                bucket.append(item)
+        for item in payload.synthesis:
+            self._pending_synthesis.setdefault(item.id, item)
+
+    def export_pending_writes(self) -> JsonValue:
+        return PendingWrites(
+            opens=[item for items in self._pending_opens.values() for item in items],
+            synthesis=list(self._pending_synthesis.values()),
+        ).model_dump(mode="json")
+
+    def import_pending_writes(self, data: JsonValue) -> None:
+        if not isinstance(data, dict):
+            return
+        payload = PendingWrites.model_validate(data)
+        for item in payload.opens:
+            bucket = self._pending_opens.setdefault(item.account_id, [])
+            if all(existing.id != item.id for existing in bucket):
+                bucket.append(item)
+        for item in payload.synthesis:
+            self._pending_synthesis.setdefault(item.id, item)
+
+    async def stash_pending_synthesis(self, record: SynthesisRecord) -> None:
+        self._pending_synthesis[record.id] = PendingSynthesis(
+            id=record.id,
+            run_id=record.run_id,
+            account_id=record.account_id,
+            created_at=record.created_at,
+            mode=record.mode,
+            material_ids=record.material_ids,
+            before_quantity=record.before_quantity,
+            after_quantity=record.after_quantity,
+            state=record.state,
+            result=record.result,
+            error=record.error,
+        )
+        await self.save_pending_writes()
+
+    async def _flush_pending_opens(self, key: str, task: ChestTask | None = None) -> int:
+        if key not in self._pending_opens:
+            return 0
+        pending = self._pending_opens[key]
+        committed_count = 0
+        changed = False
+        try:
+            while pending:
+                item = pending[0]
+                committed = await Store.record_chest_open(
+                    item.account_id, item.info_json, item.verified_at, item.to_record()
+                )
+                pending.pop(0)
+                changed = True
+                if committed:
+                    committed_count += 1
+                    if task is not None and task.run_id == item.run_id:
+                        task.successes += 1
+        finally:
+            if not pending:
+                self._pending_opens.pop(key, None)
+            if changed:
+                await self.save_pending_writes()
+        return committed_count
+
+    async def _flush_pending_synthesis(self) -> int:
+        if not self._pending_synthesis:
+            return 0
+        committed_count = 0
+        changed = False
+        try:
+            for item_id in tuple(self._pending_synthesis):
+                item = self._pending_synthesis[item_id]
+                await Store.save(item.to_record())
+                self._pending_synthesis.pop(item_id, None)
+                committed_count += 1
+                changed = True
+        finally:
+            if changed:
+                await self.save_pending_writes()
+        return committed_count
+
+    async def flush_all_pending_writes(self, *, timeout: float = 5.0) -> None:
+        """退出或启动时尽力补写已确认的开箱和合成回执；未写完的保留在磁盘供下次启动恢复。"""
+        if not self.database_ready or (not self._pending_opens and not self._pending_synthesis):
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                for key in tuple(self._pending_opens):
+                    async with self.account_lock(key):
+                        if await self._flush_pending_opens(key) > 0:
+                            await self.queue_results(key)
+                await self._flush_pending_synthesis()
+        except (TimeoutError, DatabaseWriteTimeout, WriteGateTimeout, SQLAlchemyError, WuwaError) as error:
+            logger.warning(f"[WuwaTappoUID] 退出前补写尚未全部完成，剩余已落盘保留：{self.error_detail(error)}")
+        await self.save_pending_writes()
 
     async def open_side(self, account: Account, task: ChestTask, side: Side, info: UserInfo) -> UserInfo:
         supplement = ""
@@ -1220,8 +1466,6 @@ class Service:
             except OperationStopped:
                 return info
             except ApiError as error:
-                if error.code not in (70003, 70004, 70005, 70006, 10014):
-                    await self.queue_results(account.id, force=True, reason="开箱失败，汇总已开结果")
                 if error.code == 70005 and attempt == 0 and not supplement:
                     info, delta, problem = await self.add_clicks(account, AUTO_CLICKS, task, info)
                     supplement = f"自动补充 {AUTO_CLICKS} 点击后实际变化 {delta:+d}" + (
@@ -1238,13 +1482,12 @@ class Service:
                 if supplement:
                     await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}（{supplement}）。")
                 raise
-            except (NetworkError, DataError):
-                await self.queue_results(account.id, force=True, reason="开箱响应中断")
-                raise
             info.total_click_consume += result.click_consume
             info.set_cooldown(side, time.time() + CHEST_COOLDOWN)
-            account.info = info.model_dump_json()
-            account.verified_at = time.time()
+            info_json = info.model_dump_json()
+            verified_at = time.time()
+            account.info = info_json
+            account.verified_at = verified_at
             record = ChestRecord(
                 account_id=account.id,
                 run_id=task.run_id,
@@ -1255,8 +1498,29 @@ class Service:
                 result=result.model_dump_json(),
                 supplement=supplement,
             )
-            task.successes += 1
-            await Store.save(account, record, task)
+            pending = PendingOpen(
+                id=record.id,
+                account_id=record.account_id,
+                run_id=record.run_id,
+                subscription_id=record.subscription_id,
+                side=record.side,
+                created_at=record.created_at,
+                before_info=record.before_info,
+                result=record.result,
+                supplement=record.supplement,
+                info_json=info_json,
+                verified_at=verified_at,
+            )
+            try:
+                committed = await Store.record_chest_open(account.id, info_json, verified_at, record)
+            except (DatabaseWriteTimeout, WriteGateTimeout, SQLAlchemyError):
+                bucket = self._pending_opens.setdefault(account.id, [])
+                if all(existing.id != pending.id for existing in bucket):
+                    bucket.append(pending)
+                await self.save_pending_writes()
+                raise
+            if committed:
+                task.successes += 1
             await self.failures.success("check:" + task.account_id)
             await self.queue_results(account.id)
             return info
@@ -1298,12 +1562,18 @@ class Service:
             retry = False
             interrupted = False
             try:
+                if await self._flush_pending_opens(key, task) > 0:
+                    reloaded = await Store.task(key)
+                    if reloaded is None or reloaded.status not in ("active", "paused"):
+                        return
+                    task = reloaded
+                    await self.queue_results(key)
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "自动开箱已到期")
                     return
                 if await self.pause_invalid_route(task):
                     return
-                if task.status == "paused" and task.pause_reason in ("auth", "route"):
+                if task.status == "paused":
                     return
                 if not task.reminded and task.expires_at - time.time() <= RENEW_WINDOW:
                     task.reminded = True
@@ -1316,10 +1586,10 @@ class Service:
                                 f"自动开箱剩余不足 1 小时（{date_text(task.expires_at)} 到期），"
                                 f"发送 {command_prefix()}宝箱 可顺延 {chest_task_hours()} 小时。"
                             ),
+                            task_run_id=task.run_id,
+                            task_expires_at=task.expires_at,
                         ),
                     )
-                if task.status == "paused":
-                    return
                 if not self.failures.allows("check:" + key):
                     retry = True
                     return
@@ -1342,6 +1612,7 @@ class Service:
                         if error.code == 70003:
                             info = await self.refresh(account, fresh=True, force_remote=True)
                             await self.task_failure(task, error)
+                            interrupted = True
                             retry = True
                             return
                         if error.code in (70004, 10014):
@@ -1360,6 +1631,7 @@ class Service:
                 task.status = "paused"
                 task.pause_reason = "failure"
                 task.paused_at = None
+                task.next_check = task.expires_at
                 await self.failures.success("check:" + key)
                 await Store.save(
                     task,
@@ -1381,6 +1653,7 @@ class Service:
                 interrupted = True
                 task.status = "paused"
                 task.pause_reason = "auth"
+                task.next_check = task.expires_at
                 await Store.save(task)
                 self.unschedule(key)
             except ApiError as error:
@@ -1394,6 +1667,7 @@ class Service:
                             await self.expire_account(account)
                         task.status = "paused"
                         task.pause_reason = "auth"
+                        task.next_check = task.expires_at
                         await Store.save(task)
                         self.unschedule(key)
                     else:
@@ -1417,7 +1691,7 @@ class Service:
                     task.next_check = self.next_wakeup(task, info, retry)
                     self.schedule(task)
                 try:
-                    if self.database_ready and interrupted:
+                    if self.database_ready and interrupted and task.status != "active":
                         await self.queue_results(key, force=True, reason="任务中断，汇总已开结果")
                     if self.database_ready and task.status in ("active", "paused"):
                         await Store.save(task)
@@ -1431,8 +1705,9 @@ class Service:
                     if failure.blocked:
                         self.unschedule(key)
                     else:
-                        task.next_check = max(time.time() + 60, self.failures.retry_after("save:" + key))
-                        self.schedule(task)
+                        retry_at = max(time.time() + 60, self.failures.retry_after("save:" + key))
+                        task.next_check = retry_at
+                        self.schedule(task, run_at=retry_at)
 
     async def restore(self) -> None:
         for snapshot in await Store.active_tasks():
@@ -1457,6 +1732,7 @@ class Service:
                     if task.status == "active":
                         task.status = "paused"
                         task.pause_reason = "auth"
+                        task.next_check = task.expires_at
                         await Store.save(task)
                     self.schedule(task)
                     return
@@ -1469,7 +1745,7 @@ class Service:
                     self.unschedule(task.account_id)
                     return
                 # 不改变 started_at / expires_at；停机期间不补开历史轮次。
-                task.next_check = time.time()
+                task.next_check = task.expires_at if task.status == "paused" else time.time()
                 await Store.save(task)
                 self.schedule(task)
 
@@ -1552,6 +1828,32 @@ class Service:
 
     async def _maintain(self) -> None:
         if not self.closing:
+            for key in tuple(self._pending_opens):
+                if self.closing:
+                    break
+                if self.account_lock(key).locked() or not self.failures.cooldown_ready("open-save:" + key):
+                    continue
+                async with self.account_lock(key):
+                    try:
+                        if await self._flush_pending_opens(key) > 0:
+                            await self.queue_results(key)
+                        await self.failures.success("open-save:" + key)
+                    except SQLAlchemyError:
+                        raise
+                    except Exception as error:
+                        await self.failures.fail(
+                            "open-save:" + key, "开箱流水补写", self.error_detail(error), key, blocked_delay=300
+                        )
+            if self._pending_synthesis and self.failures.cooldown_ready("synthesis-save"):
+                try:
+                    await self._flush_pending_synthesis()
+                    await self.failures.success("synthesis-save")
+                except SQLAlchemyError:
+                    raise
+                except Exception as error:
+                    await self.failures.fail(
+                        "synthesis-save", "合成流水补写", self.error_detail(error), blocked_delay=300
+                    )
             for task in await Store.active_tasks():
                 if task.timer_paused:
                     continue
@@ -1563,11 +1865,11 @@ class Service:
                 # 正在检查的账号持有账号锁，收尾时会自己排下一次。
                 if scheduler.get_job(self.job_id(key)) is None and not self.account_lock(key).locked():
                     logger.warning("[WuwaTappoUID] 发现没有排期的宝箱任务，已重新安排检查。")
-                    task.next_check = time.time()
+                    task.next_check = task.expires_at if task.status == "paused" else time.time()
                     self.schedule(task)
                     await self.failures.success("restore:" + key)
             for key in await Store.result_accounts():
-                if self.account_lock(key).locked() or not self.failures.allows("results:" + key):
+                if self.account_lock(key).locked() or not self.failures.cooldown_ready("results:" + key):
                     continue
                 async with self.account_lock(key):
                     try:
@@ -1578,7 +1880,9 @@ class Service:
                     except MaintenanceError:
                         continue
                     except Exception as error:
-                        await self.failures.fail("results:" + key, "开箱结果汇总", self.error_detail(error), key)
+                        await self.failures.fail(
+                            "results:" + key, "开箱结果汇总", self.error_detail(error), key, blocked_delay=900
+                        )
             now = time.time()
             for key in await Store.renewable_accounts(now + TOKEN_RENEW_WINDOW, now):
                 if self.closing:

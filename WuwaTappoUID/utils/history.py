@@ -110,7 +110,9 @@ class HistoryArchive:
         result = await session.execute(
             select(Notice)
             .where(
-                col(Notice.delivery_state).in_(["submitted", "unroutable"]), Notice.finished_at < cutoff, ~referenced
+                col(Notice.delivery_state).in_(["submitted", "unroutable", "superseded"]),
+                Notice.finished_at < cutoff,
+                ~referenced,
             )
             .order_by(col(Notice.finished_at), col(Notice.id))
             .limit(BATCH_SIZE)

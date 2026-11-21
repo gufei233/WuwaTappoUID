@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from datetime import datetime, timezone
 
 from gsuid_core.aps import scheduler
 from gsuid_core.data_store import get_res_path
@@ -20,7 +21,17 @@ from .utils.failures import ALERT_JOB
 from .utils.lifecycle import RuntimeOwner
 from .utils.login import LoginManager
 from .utils.resources import Resources
-from .utils.schema import DatabaseSchemaError, DataError, MaintenanceError, SessionImport, WuwaError, token_expiry
+from .utils.schema import (
+    CN_SERVER_ID,
+    NET_SERVER_IDS,
+    DatabaseSchemaError,
+    DataError,
+    MaintenanceError,
+    SessionImport,
+    UserInfo,
+    WuwaError,
+    token_expiry,
+)
 from .utils.service import Service, account_id, identity
 from .utils.settings import retry_limit
 from .utils.status import register_status_panel
@@ -53,6 +64,12 @@ async def import_sessions() -> None:
         info = await api.me(entry.token)
         if str(info.cuid) != entry.cuid:
             raise DataError("导入的登录态与 CUID 不一致；文件已保留。")
+        if info.is_domestic is not None and info.is_domestic != entry.domestic:
+            raise DataError("导入的登录态与指定区服不一致；文件已保留。")
+        if info.is_domestic is None and str(info.server_id) in NET_SERVER_IDS and entry.domestic == 1:
+            raise DataError("导入的登录态属于海外区服，与指定区服不一致；文件已保留。")
+        if info.is_domestic is None and str(info.server_id) == CN_SERVER_ID and entry.domestic == 0:
+            raise DataError("导入的登录态属于国服，与指定区服不一致；文件已保留。")
         verified.append(
             Account(
                 id=account_id(entry.cuid, entry.domestic),
@@ -69,6 +86,7 @@ async def import_sessions() -> None:
         old_account = await Store.account(account.id)
         if old_account is not None:
             account.subscribed = old_account.subscribed
+            account.info = UserInfo.model_validate_json(account.info).merge_saved(old_account.info).model_dump_json()
             if old_account.sdk_owner_id != owner:
                 account.sdk_token = old_account.sdk_token
                 account.sdk_openid = old_account.sdk_openid
@@ -116,6 +134,8 @@ async def initialize() -> None:
             return
         service.database_ready = True
         service.database_error = ""
+        await service.load_pending_writes()
+        await service.flush_all_pending_writes()
         await service.failures.success("database")
         await service.failures.success("initialize")
         try:
@@ -128,33 +148,66 @@ async def initialize() -> None:
             await service.failures.fail("import", "登录态导入", detail, limit=1)
 
 
-async def wt_update_resources() -> None:
+def schedule_resource_retry() -> None:
+    if service.closing or not owner.active:
+        return
+    retry_at = resources.next_retry_at
+    if retry_at is None:
+        if not resources.incomplete:
+            job = scheduler.get_job(RESOURCE_JOB)
+            if job is not None:
+                job.remove()
+        return
+    run_at = max(time.time() + 1, retry_at, service.failures.retry_after("resources"))
+    scheduler.add_job(
+        owner.entry(wt_update_resources, cancellable=True),
+        "date",
+        run_date=datetime.fromtimestamp(run_at, timezone.utc),
+        kwargs={"cooldown_retry": True},
+        id=RESOURCE_JOB,
+        name="WuwaTappo 名称与图库增量更新",
+        replace_existing=True,
+        misfire_grace_time=None,
+    )
+
+
+async def wt_update_resources(*, cooldown_retry: bool = False) -> None:
     # 连续异常计数仅在本次运行中使用，待发送告警单独落盘。
-    while not service.closing:
-        if service.failures.blocked("resources"):
-            return
-        delay = max(0, service.failures.retry_after("resources") - time.time())
-        if delay:
-            await asyncio.sleep(delay)
-        if service.closing:
-            return
-        try:
-            result = await resources.update()
-        except MaintenanceError:
-            await asyncio.sleep(60)
-            continue
-        except Exception as error:
-            if service.failures.attempts("resources") == 0:
-                logger.exception("[WuwaTappoUID] 资源更新出现意外错误")
-            await service.failures.fail("resources", "资源更新", service.error_detail(error))
-        else:
-            logger.info(f"[WuwaTappoUID] {result}")
-            if not resources.incomplete:
-                await service.failures.success("resources")
+    allow_blocked = cooldown_retry
+    try:
+        while not service.closing:
+            if service.failures.blocked("resources"):
+                if not allow_blocked:
+                    return
+                allow_blocked = False
+            else:
+                allow_blocked = False
+                delay = max(0, service.failures.retry_after("resources") - time.time())
+                if delay:
+                    await asyncio.sleep(delay)
+            if service.closing:
                 return
-            await service.failures.fail("resources", "资源更新", result)
-        if service.closing:
-            return
+            try:
+                result = await resources.update()
+            except MaintenanceError:
+                if service.failures.blocked("resources"):
+                    allow_blocked = True
+                await asyncio.sleep(60)
+                continue
+            except Exception as error:
+                if service.failures.attempts("resources") == 0:
+                    logger.exception("[WuwaTappoUID] 资源更新出现意外错误")
+                await service.failures.fail("resources", "资源更新", service.error_detail(error), blocked_delay=900)
+            else:
+                logger.info(f"[WuwaTappoUID] {result}")
+                if not resources.incomplete:
+                    await service.failures.success("resources")
+                    return
+                await service.failures.fail("resources", "资源更新", result, blocked_delay=900)
+            if service.closing:
+                return
+    finally:
+        schedule_resource_retry()
 
 
 async def start_jobs() -> None:

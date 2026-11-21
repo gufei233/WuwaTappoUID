@@ -92,8 +92,16 @@ def network_details(path: str, error: Exception, status: int | None = None, requ
     elif isinstance(error, TimeoutError):
         reason = "请求超时"
     else:
-        reason = type(error).__name__
-    return f"接口 {path}，HTTP {status}，异常 {type(error).__name__}，原因 {reason}，请求ID {request_id or '未提供'}"
+        reason = ""
+    parts = [f"接口 {path}"]
+    if status is not None:
+        parts.append(f"HTTP {status}")
+    parts.append(f"异常 {type(error).__name__}")
+    if reason:
+        parts.append(f"原因 {reason}")
+    if request_id:
+        parts.append(f"请求ID {request_id}")
+    return "，".join(parts)
 
 
 async def retry_network(operation: Callable[[], Awaitable[R]], label: str) -> R:
@@ -355,14 +363,16 @@ class WuwaAPI:
                         f"资源 {url.split('?', 1)[0]}，HTTP {response.status}，"
                         f"请求ID {response.headers.get('x-request-id', '未提供')}",
                     )
+                if response.status in (404, 410):
+                    raise DataError(f"资源不存在（HTTP {response.status}）。", permanent=True)
                 if response.status >= 400:
                     raise DataError(f"资源下载被拒绝（HTTP {response.status}）。")
                 if response.content_length is not None and response.content_length > limit:
-                    raise DataError("资源文件过大，已跳过。")
+                    raise DataError("资源文件过大，已跳过。", permanent=True)
                 body = bytearray()
                 async for chunk in response.content.iter_chunked(64 * 1024):
                     if len(body) + len(chunk) > limit:
-                        raise DataError("资源文件过大，已跳过。")
+                        raise DataError("资源文件过大，已跳过。", permanent=True)
                     body.extend(chunk)
                 return Download(
                     bytes(body), response.headers.get("ETag", ""), response.headers.get("Last-Modified", "")
